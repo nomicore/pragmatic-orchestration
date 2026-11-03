@@ -49,6 +49,13 @@
       "label": "Gemini",
       "supports_delegate": false
     },
+    "antigravity": {
+      "enabled": false,
+      "backend": "antigravity",
+      "model": "gemini-4-argon-high",
+      "role": "lateral",
+      "label": "Antigravity Gemini 4 Argon High"
+    },
     "opencode": {
       "enabled": false,
       "backend": "opencode",

@@ -5,6 +5,7 @@
 - Python 3
 - At least one supported harness: Codex CLI, OpenCode, Claude Code, or native Grok Build
 - Gemini CLI is optional and review-only
+- Antigravity CLI (`agy`) is optional: review and one-shot delegate, signed in through `agy` itself
 - Devin CLI is optional and opt-in: `devin` v3000.x on PATH, authenticated via `devin auth login`
 
 Authentication stays with each harness.
@@ -16,7 +17,7 @@ Profiles live in `config.json`; set `PORCH_CONFIG` to use another file.
 | Field | Purpose |
 |---|---|
 | `enabled` | Default participation in `review ask` and the basic review pool |
-| `backend` | `codex-cli`, `claude-code`, `opencode`, `grok-build`, `gemini-cli`, or `devin-cli` |
+| `backend` | `codex-cli`, `claude-code`, `opencode`, `grok-build`, `gemini-cli`, `devin-cli`, or `antigravity` |
 | `model` | Backend model id |
 | `role` | Analyst, lateral, or specialist role |
 | `effort` | Backend reasoning effort/variant |
@@ -38,6 +39,7 @@ Non-empty environment values override profile model/effort for one invocation:
 - `GROK_MODEL`, `GROK_EFFORT`
 - `GEMINI_MODEL`
 - `DEVIN_MODEL`; `PORCH_BIN_DEVIN` overrides the `devin` binary
+- `ANTIGRAVITY_MODEL`, `ANTIGRAVITY_EFFORT`; `PORCH_BIN_ANTIGRAVITY` overrides the `agy` binary
 
 The enabled `codex` profile uses `gpt-6.1-sol` at `high` effort, and the enabled
 `codex-gpt-6-luna` profile uses `gpt-6-luna` at `low` effort.

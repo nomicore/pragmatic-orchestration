@@ -373,6 +373,29 @@ OPENCODE_EFFORT="none" PORCH_DUMP_ARGV="$TMP/opencode-none.json" \
 argv=$(python3 -c 'import json; print(" ".join(json.load(open("'"$TMP/opencode-none.json"'"))["argv"]))')
 assert_not_contains "opencode shell runner treats none as no variant" "$argv" "--variant"
 
+# OpenCode 2.x: no --pure, private server per run, effort as -m model#variant
+OPENCODE_MODEL="provider/model-v2" OPENCODE_EFFORT="high" PORCH_FAKE_OPENCODE_VERSION="2.2.0" \
+  PORCH_DUMP_ARGV="$TMP/opencode-v2.json" \
+  "$LIB_DIR/backend_run.sh" --mode review --agent-id opencode --raw "hello" >/dev/null
+argv=$(python3 -c 'import json; print(" ".join(json.load(open("'"$TMP/opencode-v2.json"'"))["argv"]))')
+assert_contains "opencode 2.x uses a standalone server" "$argv" "run --standalone"
+assert_not_contains "opencode 2.x drops --pure" "$argv" "--pure"
+assert_contains "opencode 2.x puts effort in the model id" "$argv" "-m provider/model-v2#high"
+assert_not_contains "opencode 2.x has no --variant" "$argv" "--variant"
+assert_contains "opencode 2.x review keeps the read-only agent" "$argv" "--agent porch-review"
+
+OPENCODE_EFFORT="none" PORCH_FAKE_OPENCODE_VERSION="2.2.0" PORCH_DUMP_ARGV="$TMP/opencode-v2-none.json" \
+  "$LIB_DIR/backend_run.sh" --mode delegate --agent-id opencode --raw "hello" >/dev/null
+argv=$(python3 -c 'import json; print(" ".join(json.load(open("'"$TMP/opencode-v2-none.json"'"))["argv"]))')
+assert_not_contains "opencode 2.x without effort has no variant suffix" "$argv" "#"
+
+set +e
+oc_steer_err=$(cd "$TMP" && PORCH_FAKE_OPENCODE_VERSION="2.2.0" "$PORCH" delegate -a opencode "Implement" 2>&1 >/dev/null)
+oc_steer_rc=$?
+set -e
+assert_contains "opencode 2.x steerable delegate is refused" "$oc_steer_err" "--one-shot"
+assert_contains "opencode 2.x steerable delegate exits non-zero" "$([[ $oc_steer_rc -ne 0 ]] && echo nonzero)" "nonzero"
+
 # Grok review: sandbox read-only + tool allow/deny
 dump_review grok "$TMP/grok-review.json"
 argv=$(python3 -c 'import json; print(" ".join(json.load(open("'"$TMP/grok-review.json"'"))["argv"]))')
@@ -1870,6 +1893,13 @@ fi
 
 echo "=== Shared runtime contracts (offline) ==="
 if PYTHONDONTWRITEBYTECODE=1 python3 "$TESTS_DIR/opencode_go_test.py" -v; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+fi
+
+echo "=== Antigravity backend (offline) ==="
+if PYTHONDONTWRITEBYTECODE=1 python3 "$TESTS_DIR/antigravity_test.py" -v; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))

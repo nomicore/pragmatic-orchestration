@@ -18,7 +18,7 @@
 #
 # Env overrides (tests use these to inject fake CLIs):
 #   PORCH_BIN_CODEX / PORCH_BIN_CLAUDE / PORCH_BIN_OPENCODE
-#   PORCH_BIN_GEMINI / PORCH_BIN_GROK / PORCH_BIN_DEVIN
+#   PORCH_BIN_GEMINI / PORCH_BIN_GROK / PORCH_BIN_DEVIN / PORCH_BIN_ANTIGRAVITY
 #   PORCH_DUMP_ARGV=<path>  — if set, write the exact argv array as JSONL and exit 0
 #                                 without executing (used by argv safety tests).
 #
@@ -182,6 +182,10 @@ else
         devin-cli)
             MODEL="${DEVIN_MODEL:-$MODEL}"
             ;;
+        antigravity)
+            MODEL="${ANTIGRAVITY_MODEL:-$MODEL}"
+            EFFORT="${ANTIGRAVITY_EFFORT:-$EFFORT}"
+            ;;
     esac
     BIN=""
 fi
@@ -287,6 +291,7 @@ bin_for() {
         gemini-cli)  echo "${PORCH_BIN_GEMINI:-gemini}" ;;
         grok-build)  echo "${PORCH_BIN_GROK:-grok}" ;;
         devin-cli)   echo "${PORCH_BIN_DEVIN:-devin}" ;;
+        antigravity) echo "${PORCH_BIN_ANTIGRAVITY:-agy}" ;;
         *)           echo "" ;;
     esac
 }
@@ -439,8 +444,27 @@ build_cmd_claude() {
     CMD+=(-p)
 }
 
+opencode_major() {
+    # OpenCode 2.x removed `--pure` and moved effort into `-m provider/model#variant`.
+    # PORCH_OPENCODE_MAJOR overrides detection (tests, unusual builds).
+    if [[ -n "${PORCH_OPENCODE_MAJOR:-}" ]]; then
+        echo "$PORCH_OPENCODE_MAJOR"
+        return
+    fi
+    local v
+    v="$("$BIN" --version 2>/dev/null | head -n1 | sed -nE 's/^(opencode )?v?([0-9]+)\.[0-9]+.*/\2/p')"
+    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 1
+}
+
 build_cmd_opencode() {
-    CMD=("$BIN" run --pure)
+    local oc_major
+    oc_major="$(opencode_major)"
+    if [[ "$oc_major" -ge 2 ]]; then
+        # 2.x: a private server per run is the closest match to 1.x `--pure`.
+        CMD=("$BIN" run --standalone)
+    else
+        CMD=("$BIN" run --pure)
+    fi
     if [[ "$ACCESS_POLICY" == "readonly" ]]; then
         # The built-in plan agent is a planning workflow with its own plan-file
         # permissions. Review needs the full analysis/tool loop instead. Define
@@ -452,9 +476,17 @@ build_cmd_opencode() {
         # --auto is current (opencode run --help): auto-approve non-denied permissions
         CMD+=(--agent build --auto)
     fi
-    CMD+=(-m "$MODEL")
-    if [[ -n "$EFFORT" ]]; then
-        CMD+=(--variant "$EFFORT")
+    if [[ "$oc_major" -ge 2 ]]; then
+        if [[ -n "$EFFORT" ]]; then
+            CMD+=(-m "${MODEL}#${EFFORT}")
+        else
+            CMD+=(-m "$MODEL")
+        fi
+    else
+        CMD+=(-m "$MODEL")
+        if [[ -n "$EFFORT" ]]; then
+            CMD+=(--variant "$EFFORT")
+        fi
     fi
     if [[ -z "${PORCH_DUMP_ARGV:-}" ]]; then
         CMD+=(--format json)
@@ -536,7 +568,36 @@ build_cmd_devin() {
     PROMPT_VIA_FILE=1
 }
 
+build_cmd_antigravity() {
+    # Antigravity CLI (agy) print mode. `-p` always consumes the next argv
+    # element as the prompt, so the prompt is NOT passed there: an empty -p
+    # plus --input-format stream-json reads one NDJSON user message per line
+    # from stdin ({"event":"user","message":{"content":...}}). The runner
+    # wraps the prompt file into that message, keeping large prompts off argv.
+    # Print mode enables the terminal sandbox on its own; --sandbox makes that
+    # explicit. Permission grants are per-run (--settings is never saved).
+    CMD=("$BIN")
+    if [[ "$ACCESS_POLICY" == "readonly" ]]; then
+        # Valid grant actions verified against agy 1.4.x: command(...),
+        # read_file(...), write_file(...), mcp(...). Headless mode auto-denies
+        # anything that would prompt, and agy prompts for reads outside the
+        # workspace (bundles, its own truncated tool output), so reads are
+        # granted everywhere. Shell stays available for git/rg/tests and is
+        # trusted to the report-only prompt contract, same as claude-code.
+        CMD+=(--settings '{"permissions":{"allow":["command(*)","read_file(*)"],"deny":["write_file(*)","mcp(*)"]}}')
+        CMD+=(--sandbox)
+    else
+        CMD+=(--dangerously-skip-permissions)
+    fi
+    CMD+=(--disable-slash-commands --model "$MODEL")
+    if [[ -n "$EFFORT" ]]; then
+        CMD+=(--effort "$EFFORT")
+    fi
+    CMD+=(--input-format stream-json --output-format stream-json -p "")
+}
+
 case "$BACKEND" in
+    antigravity) build_cmd_antigravity ;;
     codex-cli)   build_cmd_codex ;;
     claude-code) build_cmd_claude ;;
     opencode)    build_cmd_opencode ;;
@@ -896,6 +957,63 @@ if text: open(sys.argv[2],"w",encoding="utf-8").write(text)
             # --prompt-file is the large-prompt one-shot headless path (see grok --help)
             run_streamed "grok-build" "" "${CMD[@]}" --prompt-file "$PROMPT_PATH"
             exit_code=$BACKEND_RC
+            ;;
+        antigravity)
+            if command -v "$BIN" &>/dev/null || [[ -x "$BIN" ]]; then
+                AGY_INPUT="${PROMPT_PATH}.agy.ndjson"
+                python3 -c '
+import json, sys
+body = open(sys.argv[1], encoding="utf-8").read()
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    out.write(json.dumps({"event": "user", "message": {"content": body}}) + "\n")
+' "$PROMPT_PATH" "$AGY_INPUT"
+                run_streamed "antigravity" "$AGY_INPUT" "${CMD[@]}"
+                exit_code=$BACKEND_RC
+                rm -f "$AGY_INPUT"
+            else
+                echo "agy CLI missing" >"$BACKEND_ERR"
+                exit_code=4
+            fi
+            # Authoritative final text = the last result.response. A result
+            # with status ERROR or any finished_reason (print_timeout,
+            # interrupted, error) is a failure even if the CLI exited 0.
+            if [[ -s "$RAW_STREAM" ]]; then
+                agy_state="$(python3 -c '
+import json, sys
+response = None
+failed = False
+denied = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(o, dict) or o.get("event") != "result":
+        continue
+    r = o.get("result") if isinstance(o.get("result"), dict) else {}
+    if str(r.get("status") or "").upper() == "ERROR" or r.get("finished_reason") or r.get("error"):
+        failed = True
+        continue
+    if isinstance(r.get("response"), str):
+        response = r["response"]
+    denied = [d.get("action") for d in r.get("denied_actions") or [] if isinstance(d, dict)]
+if response is not None and response.strip():
+    open(sys.argv[2], "w", encoding="utf-8").write(response)
+elif denied:
+    # Headless agy auto-denies tools that would prompt and can then end with
+    # an empty answer; say which permission was missing instead of "empty".
+    with open(sys.argv[3], "a", encoding="utf-8") as err:
+        err.write("agy denied tool permission(s) in headless mode: %s\n" % ", ".join(sorted(set(filter(None, denied)))))
+    failed = True
+print("failed" if failed else ("ok" if response else "none"))
+' "$RAW_STREAM" "$FINAL_TEXT" "$BACKEND_ERR" 2>/dev/null || echo none)"
+                if [[ "$agy_state" == "failed" && "$exit_code" -eq 0 ]]; then
+                    exit_code=1
+                fi
+            fi
             ;;
         devin-cli)
             # The ACP helper emits the raw JSON-RPC stream on stdout for

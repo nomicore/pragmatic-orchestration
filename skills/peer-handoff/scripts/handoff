@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""peer-handoff: hand a task to peer coding agents for review or an
+independent implementation, then collect and compare what they produced.
+
+The orchestrating agent (the one that did the work) builds a handoff bundle:
+the task, the project context, and what it did. Peers then either review that
+work (read-only, through `porch review`) or implement the same task
+independently in their own git worktrees (through `porch delegate`). `collect`
+gathers every implementation, runs the acceptance checks, and writes a
+comparison the orchestrator uses to pick the best parts.
+
+Bundles live outside the repository, under $PEER_HANDOFF_HOME
+(default ~/.peer-handoff), so nothing about the task lands in the repo.
+
+Commands: init, review, compete, status, collect, adopt, cleanup, list.
+Run `handoff <command> --help` for options. Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_DIR = SCRIPT_DIR.parent
+PROMPTS_DIR = SKILL_DIR / "prompts"
+SIBLING_PORCH = SKILL_DIR.parent / "pragmatic-orchestration" / "scripts" / "porch"
+
+LINEAR_URL = os.environ.get("PEER_HANDOFF_LINEAR_URL", "https://api.linear.app/graphql")
+INLINE_CONTEXT_LIMIT = 20_000  # bytes per context file inlined into briefs
+CHECK_TIMEOUT = int(os.environ.get("PEER_HANDOFF_CHECK_TIMEOUT", "1800"))
+OURS = "ours"
+
+EXIT_USAGE = 2
+EXIT_FAIL = 1
+
+
+class HandoffError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def slugify(text: str, limit: int = 40) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (slug[:limit].strip("-")) or "task"
+
+
+def run(argv: Sequence[str], cwd: Optional[Path] = None, check: bool = True,
+        input_text: Optional[str] = None, timeout: Optional[int] = None,
+        env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    proc = subprocess.run(list(argv), cwd=str(cwd) if cwd else None, text=True,
+                          input=input_text, capture_output=True, timeout=timeout, env=env)
+    if check and proc.returncode != 0:
+        raise HandoffError(f"command failed ({proc.returncode}): {shlex.join(argv)}\n{proc.stderr.strip()}")
+    return proc
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    return run(["git", "-C", str(repo), *args], check=check).stdout
+
+
+def porch_bin() -> str:
+    explicit = os.environ.get("PEER_HANDOFF_PORCH")
+    if explicit:
+        return explicit
+    if SIBLING_PORCH.is_file():
+        return str(SIBLING_PORCH)
+    found = shutil.which("porch")
+    if found:
+        return found
+    raise HandoffError("porch not found: install the pragmatic-orchestration skill or set PEER_HANDOFF_PORCH")
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("PEER_HANDOFF_HOME", str(Path.home() / ".peer-handoff"))).expanduser()
+
+
+def write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def load_manifest(bundle: Path) -> Dict[str, Any]:
+    mf = bundle / "manifest.json"
+    if not mf.is_file():
+        raise HandoffError(f"not a handoff bundle (no manifest.json): {bundle}")
+    return json.loads(mf.read_text(encoding="utf-8"))
+
+
+def save_manifest(bundle: Path, manifest: Dict[str, Any]) -> None:
+    write(bundle / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+
+
+def resolve_bundle(ref: str) -> Path:
+    path = Path(ref).expanduser()
+    if path.is_dir():
+        return path.resolve()
+    matches = sorted(home_dir().glob(f"*/{ref}"))
+    if len(matches) == 1:
+        return matches[0].resolve()
+    if not matches:
+        raise HandoffError(f"bundle not found: {ref}")
+    raise HandoffError(f"bundle id is ambiguous: {ref}: " + ", ".join(str(m) for m in matches))
+
+
+def repo_root(path: Path) -> Path:
+    return Path(git(path, "rev-parse", "--show-toplevel").strip()).resolve()
+
+
+def default_base(repo: Path) -> str:
+    head = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False).strip()
+    candidates = [head] if head else []
+    candidates += ["origin/main", "origin/master", "main", "master"]
+    for ref in candidates:
+        if ref and run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref], check=False).returncode == 0:
+            return ref
+    raise HandoffError("cannot infer the base branch; pass --base")
+
+
+def render_template(name: str, values: Dict[str, str]) -> str:
+    text = (PROMPTS_DIR / name).read_text(encoding="utf-8")
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), ""), text)
+
+
+def agent_backends() -> Dict[str, str]:
+    """Map agent id → backend from `porch --list-agents`."""
+    out = run([porch_bin(), "--list-agents"], check=False).stdout
+    return {m.group(1): m.group(2) for m in re.finditer(r'<agent id="([^"]+)"[^>]*backend="([^"]+)"', out)}
+
+
+ONE_SHOT_BACKENDS = {"antigravity"}  # porch delegate has no steering transport for these
+
+
+def opencode_is_one_shot() -> bool:
+    """porch steers OpenCode through its 1.x server API; 2.x runs one-shot only."""
+    forced = os.environ.get("PORCH_OPENCODE_MAJOR")
+    if forced:
+        return forced.isdigit() and int(forced) >= 2
+    binary = os.environ.get("PORCH_BIN_OPENCODE", "opencode")
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    first = out.strip().splitlines()[0] if out.strip() else ""
+    m = re.match(r"(?:opencode )?v?(\d+)\.\d+", first)
+    return bool(m) and int(m.group(1)) >= 2
+
+
+def is_one_shot_backend(backend: str) -> bool:
+    if backend in ONE_SHOT_BACKENDS:
+        return True
+    return backend == "opencode" and opencode_is_one_shot()
+
+
+# ---------------------------------------------------------------- task sources
+
+LINEAR_QUERY = """
+query Issue($id: String!) {
+  issue(id: $id) {
+    identifier title url description priorityLabel
+    state { name } assignee { name } team { key name } project { name }
+    labels { nodes { name } }
+    parent { identifier title }
+    children { nodes { identifier title state { name } } }
+    attachments { nodes { title url } }
+    comments(first: 50) { nodes { body createdAt user { name } } }
+  }
+}
+"""
+
+
+def fetch_linear_issue(identifier: str) -> Dict[str, Any]:
+    key = os.environ.get("LINEAR_API_KEY", "").strip()
+    if not key:
+        raise HandoffError("LINEAR_API_KEY is not set; export it or pass --task-file instead")
+    body = json.dumps({"query": LINEAR_QUERY, "variables": {"id": identifier}}).encode()
+    req = urllib.request.Request(LINEAR_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": key})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise HandoffError(f"Linear API HTTP {exc.code} for {identifier}") from None
+    except urllib.error.URLError as exc:
+        raise HandoffError(f"Linear API unreachable: {exc.reason}") from None
+    if data.get("errors"):
+        raise HandoffError("Linear API error: " + "; ".join(e.get("message", "?") for e in data["errors"]))
+    issue = (data.get("data") or {}).get("issue")
+    if not issue:
+        raise HandoffError(f"Linear issue not found: {identifier}")
+    return issue
+
+
+def linear_issue_markdown(issue: Dict[str, Any]) -> str:
+    def nodes(key: str) -> List[Dict[str, Any]]:
+        return ((issue.get(key) or {}).get("nodes")) or []
+
+    lines = [f"# {issue.get('identifier', '')}: {issue.get('title', '')}", ""]
+    meta = [
+        ("URL", issue.get("url")),
+        ("State", (issue.get("state") or {}).get("name")),
+        ("Priority", issue.get("priorityLabel")),
+        ("Team", (issue.get("team") or {}).get("name")),
+        ("Project", (issue.get("project") or {}).get("name")),
+        ("Assignee", (issue.get("assignee") or {}).get("name")),
+        ("Labels", ", ".join(n["name"] for n in nodes("labels")) or None),
+    ]
+    parent = issue.get("parent")
+    if parent:
+        meta.append(("Parent", f"{parent.get('identifier')}: {parent.get('title')}"))
+    lines += [f"- **{k}:** {v}" for k, v in meta if v]
+    lines += ["", "## Description", "", (issue.get("description") or "_No description._").strip(), ""]
+    children = nodes("children")
+    if children:
+        lines += ["## Sub-issues", ""]
+        lines += [f"- {c.get('identifier')}: {c.get('title')} ({(c.get('state') or {}).get('name', '')})" for c in children]
+        lines.append("")
+    attachments = nodes("attachments")
+    if attachments:
+        lines += ["## Attachments", ""]
+        lines += [f"- {a.get('title') or a.get('url')}: {a.get('url')}" for a in attachments]
+        lines.append("")
+    comments = nodes("comments")
+    if comments:
+        lines += ["## Comments", ""]
+        for c in sorted(comments, key=lambda c: c.get("createdAt") or ""):
+            who = (c.get("user") or {}).get("name") or "unknown"
+            lines += [f"### {who}, {(c.get('createdAt') or '')[:10]}", "", (c.get("body") or "").strip(), ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".json", ".yaml", ".yml", ".csv", ".html", ".xml", ""}
+
+
+def task_file_markdown(path: Path) -> str:
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("identifier") and data.get("title"):
+            return linear_issue_markdown(data)  # a saved Linear issue export
+        if data is not None:
+            return f"# Task ({path.name})\n\n```json\n{json.dumps(data, indent=2)}\n```\n"
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return path.read_text(encoding="utf-8", errors="replace").rstrip() + "\n"
+    return f"# Task ({path.name})\n\nBinary task document; read it directly: `{path}`\n"
+
+
+# ---------------------------------------------------------------- init
+
+def cmd_init(args: argparse.Namespace) -> int:
+    repo = repo_root(Path(args.repo).resolve())
+    base_ref = args.base or default_base(repo)
+    base_sha = git(repo, "merge-base", base_ref, args.head).strip()
+    head_sha = git(repo, "rev-parse", args.head).strip()
+    branch = git(repo, "rev-parse", "--abbrev-ref", args.head).strip()
+
+    task_parts: List[str] = []
+    task_sources: List[str] = []
+    title_hint = ""
+    for ident in args.task_linear or []:
+        issue = fetch_linear_issue(ident)
+        task_parts.append(linear_issue_markdown(issue))
+        task_sources.append(f"linear:{issue.get('identifier', ident)}")
+        title_hint = title_hint or f"{issue.get('identifier', '')} {issue.get('title', '')}"
+    for f in args.task_file or []:
+        path = Path(f).expanduser().resolve()
+        task_parts.append(task_file_markdown(path))
+        task_sources.append(f"file:{path}")
+        title_hint = title_hint or path.stem
+    for t in args.task_text or []:
+        task_parts.append(t.rstrip() + "\n")
+        task_sources.append("text")
+        title_hint = title_hint or t[:60]
+    if not task_parts:
+        raise HandoffError("no task: pass --task-linear, --task-file or --task-text")
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bundle_id = f"{stamp}-{slugify(args.slug or title_hint or branch)}"
+    bundle = home_dir() / slugify(repo.name, 60) / bundle_id
+    bundle.mkdir(parents=True, exist_ok=False)
+
+    # Context: small text files inline; large or binary files are copied and referenced.
+    ctx_lines: List[str] = []
+    ctx_sources: List[str] = []
+    for note in args.context_note or []:
+        ctx_lines += [note.rstrip(), ""]
+    for f in args.context_file or []:
+        path = Path(f).expanduser().resolve()
+        ctx_sources.append(str(path))
+        size = path.stat().st_size
+        if path.suffix.lower() in TEXT_SUFFIXES and size <= INLINE_CONTEXT_LIMIT:
+            ctx_lines += [f"## Context file: {path.name}", "",
+                          path.read_text(encoding="utf-8", errors="replace").rstrip(), ""]
+        else:
+            dest = bundle / "context" / path.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+            ctx_lines += [f"## Context file: {path.name}", "",
+                          f"Large document ({size // 1024} KiB); read it in full: `{dest}`", ""]
+    context_md = "\n".join(ctx_lines).rstrip() + "\n" if ctx_lines else "_No additional project context supplied._\n"
+
+    # What the orchestrator did.
+    log = git(repo, "log", "--reverse", "--format=- %h %s", f"{base_sha}..{head_sha}").strip()
+    stat = git(repo, "diff", "--stat", f"{base_sha}..{head_sha}").strip()
+    patch = git(repo, "diff", "--binary", f"{base_sha}..{head_sha}")
+    dirty = git(repo, "status", "--porcelain").strip()
+    notes = ""
+    if args.notes_file:
+        notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8")
+    if args.notes:
+        notes = (notes + "\n" + args.notes).strip()
+    work_md = "\n".join([
+        f"- **Repository root:** `{repo}`",
+        f"- **Branch:** `{branch}`",
+        f"- **Base:** `{base_ref}` @ `{base_sha[:12]}`",
+        f"- **Head:** `{head_sha[:12]}`",
+        "",
+        "### Commits since base", "", log or "_No commits yet._", "",
+        "### Diffstat", "", f"```\n{stat}\n```" if stat else "_No committed changes._", "",
+        "### Implementer's notes", "", notes.strip() or "_None._", "",
+    ])
+    if dirty:
+        work_md += "\n> Uncommitted changes existed when the bundle was created; they are not in `ours.patch`.\n"
+
+    checks = list(args.check or [])
+    manifest = {
+        "version": 1, "id": bundle_id, "created": now_iso(), "repo": str(repo),
+        "base_ref": base_ref, "base_sha": base_sha, "head": args.head, "head_sha": head_sha,
+        "branch": branch, "task_sources": task_sources, "context_sources": ctx_sources,
+        "checks": checks, "runs": {}, "reviews": [],
+    }
+    write(bundle / "task.md", "\n\n".join(task_parts))
+    write(bundle / "context.md", context_md)
+    write(bundle / "work.md", work_md)
+    write(bundle / "ours.patch", patch)
+    save_manifest(bundle, manifest)
+    write_briefs(bundle, manifest)
+    if dirty and not args.quiet:
+        print("warning: the working tree has uncommitted changes; commit them first so peers see them", file=sys.stderr)
+    print(bundle)
+    return 0
+
+
+def checks_md(checks: Sequence[str]) -> str:
+    if not checks:
+        return "_No acceptance commands were specified; choose and run the relevant tests yourself._"
+    return "\n".join(f"- `{c}`" for c in checks)
+
+
+def relevant_files_block(bundle: Path) -> str:
+    """Seed for reviewers in the shape porch's review guide asks callers for."""
+    files = patch_stats((bundle / "ours.patch").read_text(encoding="utf-8"))["files"]
+    lines = ['<initial_relevant_files completeness="likely-partial">']
+    lines += [f"- {f}: changed by the implementation" for f in files] or ["- (no committed changes)"]
+    lines += ["This list is likely incomplete. It is not an allowlist or a scope boundary:",
+              "search wider for callers, callees, related implementations, tests, configuration",
+              "and anything else the change can affect.", "</initial_relevant_files>"]
+    return "\n".join(lines)
+
+
+def write_briefs(bundle: Path, manifest: Dict[str, Any]) -> None:
+    common = {
+        "TASK": (bundle / "task.md").read_text(encoding="utf-8").strip(),
+        "CONTEXT": (bundle / "context.md").read_text(encoding="utf-8").strip(),
+        "WORK": (bundle / "work.md").read_text(encoding="utf-8").strip(),
+        "REPO": manifest["repo"],
+        "BASE_SHA": manifest["base_sha"],
+        "HEAD_SHA": manifest["head_sha"],
+        "BRANCH": manifest["branch"],
+        "CHECKS": checks_md(manifest.get("checks") or []),
+        "PATCH_PATH": str(bundle / "ours.patch"),
+        "RELEVANT_FILES": relevant_files_block(bundle),
+    }
+    write(bundle / "brief-review.md", render_template("review-brief.md", common))
+    # The implement brief is completed per worker (working root) at launch time.
+    write(bundle / "brief-implement.md", render_template("implement-brief.md", dict(common, WORKTREE="{{WORKTREE}}")))
+
+
+# ---------------------------------------------------------------- review
+
+def cmd_review(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    repo = Path(manifest["repo"])
+    head = manifest["head_sha"]
+    current = git(repo, "rev-parse", "HEAD").strip()
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    review_root = repo
+    review_wt: Optional[Path] = None
+    brief = bundle / "brief-review.md"
+    if current != head and not args.allow_head_mismatch:
+        # The user's checkout moved on. Review from a throwaway detached
+        # worktree at the reviewed commit instead of touching their checkout.
+        review_wt = bundle / "worktrees" / f"review-{head[:12]}"
+        if not review_wt.exists():
+            git(repo, "worktree", "add", "--detach", str(review_wt), head)
+        review_root = review_wt
+        brief = bundle / "runs" / f"brief-review-{stamp}.md"
+        write(brief, (bundle / "brief-review.md").read_text(encoding="utf-8").replace(str(repo), str(review_wt)))
+        print(f"[peer-handoff] {repo} is at {current[:12]}; reviewing {head[:12]} in {review_wt}",
+              file=sys.stderr)
+    porch = porch_bin()
+    agents = ["-a", args.agents] if args.agents else []
+    if args.kind == "ask":
+        argv = [porch, "review", "ask", "--progress", args.progress, *agents,
+                "--prompt-file", str(brief)]
+        stdin = None
+    else:
+        argv = [porch, "review", "code", "--diff", "--depth", args.depth, "--progress", args.progress, *agents]
+        stdin = (bundle / "ours.patch").read_text(encoding="utf-8")
+    if args.dry_run:
+        print(f"cd {shlex.quote(str(review_root))} && {shlex.join(argv)}" + (" < ours.patch" if stdin else ""))
+        return 0
+    try:
+        proc = subprocess.run(argv, cwd=str(review_root), text=True, input=stdin if stdin is not None else "",
+                              stdout=subprocess.PIPE, stderr=None)
+    finally:
+        if review_wt is not None:
+            git(repo, "worktree", "remove", "--force", str(review_wt), check=False)
+    out = bundle / "reviews" / f"{stamp}-{args.kind}.md"
+    write(out, proc.stdout)
+    manifest.setdefault("reviews", []).append({"kind": args.kind, "agents": args.agents or "enabled",
+                                               "file": str(out), "exit": proc.returncode, "at": now_iso()})
+    save_manifest(bundle, manifest)
+    sys.stdout.write(proc.stdout)
+    print(f"\n[peer-handoff] review saved: {out} (porch exit {proc.returncode})", file=sys.stderr)
+    # porch: 0 all ok, 2 partial — both carry usable reports.
+    return 0 if proc.returncode in (0, 2) else proc.returncode
+
+
+# ---------------------------------------------------------------- compete
+
+def parse_agents(spec: str) -> List[str]:
+    agents = [a.strip() for a in spec.split(",") if a.strip()]
+    if not agents:
+        raise HandoffError("no agents given")
+    if OURS in agents:
+        raise HandoffError(f"'{OURS}' is reserved for the original work")
+    if len(set(agents)) != len(agents):
+        raise HandoffError("duplicate agent ids")
+    return agents
+
+
+def cmd_compete(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    repo = Path(manifest["repo"])
+    agents = parse_agents(args.agents)
+    backends = agent_backends()
+    unknown = [a for a in agents if a not in backends]
+    if unknown:
+        raise HandoffError("unknown porch agent id(s): " + ", ".join(unknown))
+    porch = porch_bin()
+    template = (bundle / "brief-implement.md").read_text(encoding="utf-8")
+    launched = []
+    for agent in agents:
+        if agent in manifest["runs"] and not args.dry_run:
+            raise HandoffError(f"{agent} already has a run in this bundle; use a new bundle or cleanup first")
+        worktree = bundle / "worktrees" / agent
+        branch = f"handoff/{manifest['id']}/{agent}"
+        brief = bundle / f"brief-implement-{agent}.md"
+        one_shot = is_one_shot_backend(backends[agent]) or args.one_shot
+        name = slugify(f"handoff-{agent}-{manifest['id'][-20:]}", 48)
+        if one_shot:
+            launch = [porch, "delegate", "--one-shot", "-a", agent, "--prompt-file", str(brief)]
+        else:
+            launch = [porch, "delegate", "-a", agent, "--detach", "--name", name, "--prompt-file", str(brief)]
+        if args.dry_run:
+            print(f"git -C {shlex.quote(str(repo))} worktree add -b {branch} {shlex.quote(str(worktree))} {manifest['base_sha'][:12]}")
+            print(f"cd {shlex.quote(str(worktree))} && {shlex.join(launch)}")
+            continue
+        git(repo, "worktree", "add", "-b", branch, str(worktree), manifest["base_sha"])
+        write(brief, template.replace("{{WORKTREE}}", str(worktree)))
+        record: Dict[str, Any] = {"backend": backends[agent], "worktree": str(worktree), "branch": branch,
+                                  "brief": str(brief), "launched": now_iso()}
+        if one_shot:
+            out = bundle / "runs" / f"{agent}.out"
+            err = bundle / "runs" / f"{agent}.err"
+            rc = bundle / "runs" / f"{agent}.rc"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            # Background wrapper records the exit code; the parent supervises via `status`.
+            wrapper = f"{shlex.join(launch)} >{shlex.quote(str(out))} 2>{shlex.quote(str(err))} </dev/null; echo $? >{shlex.quote(str(rc))}"
+            proc = subprocess.Popen(["/bin/sh", "-c", wrapper], cwd=str(worktree),
+                                    start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            record.update({"mode": "one-shot", "pid": proc.pid, "out": str(out), "err": str(err), "rc_file": str(rc)})
+        else:
+            res = run(launch, cwd=worktree, check=False, input_text="")
+            run_id = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+            if res.returncode != 0 or not run_id:
+                record.update({"mode": "steerable", "launch_error": res.stderr.strip()[-2000:]})
+                print(f"[peer-handoff] {agent}: launch failed: {res.stderr.strip()[-500:]}", file=sys.stderr)
+            else:
+                record.update({"mode": "steerable", "run_id": run_id})
+        manifest["runs"][agent] = record
+        save_manifest(bundle, manifest)
+        launched.append((agent, record))
+    if args.dry_run:
+        return 0
+    for agent, rec in launched:
+        handle = rec.get("run_id") or (f"pid {rec['pid']}" if rec.get("pid") else "LAUNCH FAILED")
+        print(f"{agent:28} {rec['mode']:10} {handle}  {rec['worktree']}")
+    print("\nNext: check each worker within a minute (handoff status, porch delegate events RUN_ID),"
+          " then `handoff collect` when they finish.", file=sys.stderr)
+    return 0 if all(r.get("run_id") or r.get("pid") for _, r in launched) else EXIT_FAIL
+
+
+# ---------------------------------------------------------------- status
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def run_state(rec: Dict[str, Any]) -> Dict[str, Any]:
+    if rec.get("launch_error"):
+        return {"state": "launch_failed"}
+    if rec.get("mode") == "one-shot":
+        rc_file = Path(rec["rc_file"])
+        if rc_file.is_file() and rc_file.read_text().strip():
+            code = int(rc_file.read_text().strip() or "1")
+            return {"state": "completed" if code == 0 else "failed", "exit": code}
+        return {"state": "running" if pid_alive(int(rec.get("pid", 0))) else "lost"}
+    res = run([porch_bin(), "delegate", "status", rec["run_id"], "--json"], check=False)
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return {"state": "unknown", "detail": res.stderr.strip()[-300:]}
+    state = data.get("state") or data.get("status") or data.get("lifecycle") or "unknown"
+    return {"state": str(state), "raw": data}
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    if not manifest["runs"]:
+        print("no runs in this bundle")
+        return 0
+    rows = {}
+    for agent, rec in manifest["runs"].items():
+        st = run_state(rec)
+        rows[agent] = st
+        handle = rec.get("run_id") or (f"pid {rec.get('pid')}" if rec.get("pid") else "-")
+        print(f"{agent:28} {rec.get('mode', '?'):10} {st['state']:14} {handle}")
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+
+# ---------------------------------------------------------------- collect
+
+def worktree_patch(path: Path, base_sha: str) -> str:
+    """Committed + uncommitted + untracked changes vs base, without touching the index."""
+    patch = run(["git", "-C", str(path), "diff", "--binary", base_sha], check=False).stdout
+    untracked = run(["git", "-C", str(path), "ls-files", "--others", "--exclude-standard", "-z"],
+                    check=False).stdout.split("\0")
+    for rel in filter(None, untracked):
+        extra = run(["git", "-C", str(path), "diff", "--binary", "--no-index", "--", "/dev/null", rel], check=False).stdout
+        patch += extra
+    return patch
+
+
+def patch_stats(patch: str) -> Dict[str, Any]:
+    files: List[str] = []
+    added = removed = 0
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+            if m:
+                files.append(m.group(2))
+        elif line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return {"files": sorted(set(files)), "added": added, "removed": removed}
+
+
+def final_answer(rec: Dict[str, Any]) -> str:
+    if rec.get("mode") == "one-shot":
+        out = Path(rec.get("out", ""))
+        return out.read_text(encoding="utf-8", errors="replace") if out.is_file() else ""
+    if not rec.get("run_id"):
+        return ""
+    res = run([porch_bin(), "delegate", "wait", rec["run_id"], "--timeout", "1", "--json"], check=False)
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return res.stdout
+    for key in ("final_text", "final", "answer", "result", "text"):
+        if isinstance(data.get(key), str):
+            return data[key]
+    return json.dumps(data, indent=2)
+
+
+def run_checks(path: Path, checks: Sequence[str], log: Path) -> List[Dict[str, Any]]:
+    results = []
+    chunks = []
+    for c in checks:
+        try:
+            proc = subprocess.run(c, shell=True, cwd=str(path), text=True, capture_output=True, timeout=CHECK_TIMEOUT)
+            code, output = proc.returncode, proc.stdout + proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            code, output = 124, f"timed out after {CHECK_TIMEOUT}s\n{exc.stdout or ''}{exc.stderr or ''}"
+        results.append({"cmd": c, "exit": code})
+        chunks.append(f"$ {c}\n[exit {code}]\n{output[-20000:]}\n")
+    write(log, "\n".join(chunks))
+    return results
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    repo = Path(manifest["repo"])
+    base = manifest["base_sha"]
+    checks = [] if args.no_checks else list(manifest.get("checks") or []) + list(args.check or [])
+    results_dir = bundle / "results"
+    entries: Dict[str, Dict[str, Any]] = {}
+
+    candidates: Dict[str, Dict[str, Any]] = {}
+    if not args.skip_ours:
+        candidates[OURS] = {"worktree": str(repo), "mode": "original", "branch": manifest["branch"]}
+    candidates.update(manifest["runs"])
+
+    for agent, rec in candidates.items():
+        path = Path(rec["worktree"])
+        entry: Dict[str, Any] = {"agent": agent, "mode": rec.get("mode"), "worktree": str(path)}
+        if agent == OURS:
+            entry["state"] = "original"
+            patch = (bundle / "ours.patch").read_text(encoding="utf-8")
+            entry["commits"] = git(repo, "log", "--format=%h %s", f"{base}..{manifest['head_sha']}").strip().splitlines()
+        else:
+            st = run_state(rec)
+            entry["state"] = st["state"]
+            if not path.is_dir():
+                entry["state"] = "missing_worktree"
+                entries[agent] = entry
+                continue
+            patch = worktree_patch(path, base)
+            entry["commits"] = git(path, "log", "--format=%h %s", f"{base}..HEAD", check=False).strip().splitlines()
+            answer = final_answer(rec)
+            write(results_dir / f"{agent}-answer.md", answer)
+            entry["answer_file"] = str(results_dir / f"{agent}-answer.md")
+        write(results_dir / f"{agent}.patch", patch)
+        entry["patch_file"] = str(results_dir / f"{agent}.patch")
+        entry.update(patch_stats(patch))
+        if checks:
+            if agent == OURS and git(repo, "rev-parse", "HEAD").strip() != manifest["head_sha"]:
+                entry["checks"] = [{"cmd": c, "exit": None, "note": "skipped: repo not at bundle head"} for c in checks]
+            else:
+                entry["checks"] = run_checks(path, checks, results_dir / f"{agent}-checks.log")
+                entry["checks_log"] = str(results_dir / f"{agent}-checks.log")
+        entries[agent] = entry
+
+    write(results_dir / "comparison.json", json.dumps(entries, indent=2) + "\n")
+    report = comparison_markdown(manifest, entries)
+    write(bundle / "comparison.md", report)
+    print(report)
+    print(f"[peer-handoff] comparison written: {bundle / 'comparison.md'}", file=sys.stderr)
+    return 0
+
+
+def checks_cell(entry: Dict[str, Any]) -> str:
+    checks = entry.get("checks")
+    if not checks:
+        return "n/a"
+    ran = [c for c in checks if c.get("exit") is not None]
+    if not ran:
+        return "skipped"
+    passed = sum(1 for c in ran if c["exit"] == 0)
+    return f"{passed}/{len(ran)} pass"
+
+
+def comparison_markdown(manifest: Dict[str, Any], entries: Dict[str, Dict[str, Any]]) -> str:
+    lines = [f"# Peer handoff comparison: {manifest['id']}", "",
+             f"- Base: `{manifest['base_ref']}` @ `{manifest['base_sha'][:12]}`",
+             f"- Original work: `{manifest['branch']}` @ `{manifest['head_sha'][:12]}`",
+             f"- Task: {', '.join(manifest.get('task_sources') or [])}", "",
+             "| Implementation | State | Commits | Files | +/- | Checks |",
+             "|---|---|---|---|---|---|"]
+    for agent, e in entries.items():
+        lines.append(f"| {agent} | {e.get('state')} | {len(e.get('commits') or [])} | "
+                     f"{len(e.get('files') or [])} | +{e.get('added', 0)}/-{e.get('removed', 0)} | {checks_cell(e)} |")
+    all_files = sorted({f for e in entries.values() for f in e.get("files") or []})
+    if all_files:
+        agents = list(entries)
+        lines += ["", "## Files touched", "", "| File | " + " | ".join(agents) + " |",
+                  "|---|" + "---|" * len(agents)]
+        for f in all_files:
+            marks = ["x" if f in (entries[a].get("files") or []) else "" for a in agents]
+            lines.append(f"| `{f}` | " + " | ".join(marks) + " |")
+    for agent, e in entries.items():
+        lines += ["", f"## {agent}", ""]
+        if e.get("commits"):
+            lines += ["Commits:", *[f"- {c}" for c in e["commits"]], ""]
+        for c in e.get("checks") or []:
+            lines.append(f"- check `{c['cmd']}` → {'skipped' if c.get('exit') is None else 'exit ' + str(c['exit'])}")
+        for key, label in (("patch_file", "Patch"), ("answer_file", "Final answer"), ("checks_log", "Checks log")):
+            if e.get(key):
+                lines.append(f"- {label}: `{e[key]}`")
+    lines += ["", "## Next", "",
+              "Read each patch and final answer against the task's acceptance criteria. Keep one"
+              " implementation as the base, then adopt the better parts from the others with"
+              " `handoff adopt BUNDLE --from AGENT [--path FILE ...]` and re-run the checks."]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- adopt
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    repo = Path(manifest["repo"])
+    patch = bundle / "results" / f"{args.source}.patch"
+    if not patch.is_file():
+        raise HandoffError(f"no collected patch for {args.source}; run `handoff collect` first")
+    target = Path(args.into).resolve() if args.into else repo
+    argv = ["git", "-C", str(target), "apply", "--3way", "--whitespace=nowarn"]
+    for p in args.path or []:
+        argv += ["--include", p]
+    argv.append(str(patch))
+    if args.check_only:
+        argv.insert(4, "--check")
+    proc = run(argv, check=False)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    if proc.returncode == 0 and not args.check_only:
+        print(f"[peer-handoff] applied {args.source} changes to {target} (uncommitted; review, test, then commit)", file=sys.stderr)
+    return proc.returncode
+
+
+# ---------------------------------------------------------------- cleanup / list
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    repo = Path(manifest["repo"])
+    plan = []
+    for agent, rec in manifest["runs"].items():
+        st = run_state(rec)["state"]
+        if st in ("running", "active", "starting", "idle", "waiting") and not args.force:
+            raise HandoffError(f"{agent} is still {st}; cancel it (porch delegate cancel) or pass --force")
+        plan.append((agent, rec))
+    for agent, rec in plan:
+        print(f"remove worktree {rec['worktree']}" + ("" if args.keep_branches else f" and branch {rec['branch']}"))
+    if not args.yes:
+        print("dry run: pass --yes to remove", file=sys.stderr)
+        return 0
+    for agent, rec in plan:
+        if Path(rec["worktree"]).exists():
+            git(repo, "worktree", "remove", "--force", rec["worktree"], check=False)
+        if not args.keep_branches:
+            git(repo, "branch", "-D", rec["branch"], check=False)
+    git(repo, "worktree", "prune", check=False)
+    if args.delete_bundle:
+        shutil.rmtree(bundle)
+        print(f"deleted bundle {bundle}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    root = home_dir()
+    if args.repo:
+        root = root / slugify(repo_root(Path(args.repo).resolve()).name, 60)
+    for mf in sorted(root.glob("**/manifest.json")):
+        try:
+            m = json.loads(mf.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        runs = ",".join(m.get("runs") or {}) or "-"
+        print(f"{m.get('id')}  {m.get('branch')}  runs={runs}  {mf.parent}")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="handoff", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="build a handoff bundle (task + context + work done)")
+    p.add_argument("--repo", default=".", help="repository (default: current directory)")
+    p.add_argument("--base", help="base ref the work branched from (default: origin/HEAD, main or master)")
+    p.add_argument("--head", default="HEAD", help="ref holding the work to hand over (default: HEAD)")
+    p.add_argument("--task-linear", action="append", metavar="ID", help="Linear issue identifier (needs LINEAR_API_KEY)")
+    p.add_argument("--task-file", action="append", metavar="PATH", help="task document (md/txt/json; Linear JSON export rendered)")
+    p.add_argument("--task-text", action="append", metavar="TEXT", help="task description as text")
+    p.add_argument("--context-file", action="append", metavar="PATH", help="project context document (repeatable)")
+    p.add_argument("--context-note", action="append", metavar="TEXT", help="short project context note (repeatable)")
+    p.add_argument("--notes", help="what the implementer did, decisions, known gaps")
+    p.add_argument("--notes-file", help="file with the implementer's notes")
+    p.add_argument("--check", action="append", metavar="CMD", help="acceptance command run by collect (repeatable)")
+    p.add_argument("--slug", help="short name for the bundle id")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("review", help="peer review of the handed-over work (read-only, porch review)")
+    p.add_argument("bundle")
+    p.add_argument("-a", "--agents", help="comma-separated porch agent ids (default: porch enabled pool)")
+    p.add_argument("--kind", choices=["ask", "code"], default="ask",
+                   help="ask = task-aware review with the full brief (default); code = porch diff review")
+    p.add_argument("--depth", choices=["basic", "specialists", "super", "ultra"], default="basic",
+                   help="porch review code depth (kind=code)")
+    p.add_argument("--progress", choices=["full", "compact", "none"], default="compact")
+    p.add_argument("--allow-head-mismatch", action="store_true",
+                   help="review the checkout as it is, even if it is not at the bundle's head commit")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("compete", help="independent implementations, one git worktree per agent")
+    p.add_argument("bundle")
+    p.add_argument("-a", "--agents", required=True, help="comma-separated porch agent ids")
+    p.add_argument("--one-shot", action="store_true", help="run every worker one-shot (not steerable)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_compete)
+
+    p = sub.add_parser("status", help="state of each competing worker")
+    p.add_argument("bundle")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("collect", help="gather patches, answers and check results; write comparison.md")
+    p.add_argument("bundle")
+    p.add_argument("--check", action="append", metavar="CMD", help="extra acceptance command")
+    p.add_argument("--no-checks", action="store_true")
+    p.add_argument("--skip-ours", action="store_true", help="leave the original work out of the comparison")
+    p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("adopt", help="apply a peer's changes (all or some files) to the original checkout")
+    p.add_argument("bundle")
+    p.add_argument("--from", dest="source", required=True, help="agent id whose patch to apply")
+    p.add_argument("--path", action="append", metavar="GLOB", help="only these paths (repeatable)")
+    p.add_argument("--into", help="target checkout (default: the bundle's repository)")
+    p.add_argument("--check-only", action="store_true", help="test whether the patch applies")
+    p.set_defaults(func=cmd_adopt)
+
+    p = sub.add_parser("cleanup", help="remove the bundle's worktrees and branches")
+    p.add_argument("bundle")
+    p.add_argument("--yes", action="store_true", help="actually remove (default: dry run)")
+    p.add_argument("--force", action="store_true", help="also when a worker still looks active")
+    p.add_argument("--keep-branches", action="store_true")
+    p.add_argument("--delete-bundle", action="store_true", help="also delete the bundle directory")
+    p.set_defaults(func=cmd_cleanup)
+
+    p = sub.add_parser("list", help="list handoff bundles")
+    p.add_argument("--repo", help="only bundles of this repository")
+    p.set_defaults(func=cmd_list)
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except HandoffError as exc:
+        print(f"handoff: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

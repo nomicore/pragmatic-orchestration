@@ -1,6 +1,6 @@
 ---
 name: pragmatic-orchestration
-description: "Run external coding agents (Codex, Claude Code, OpenCode, native Grok Build, Gemini, Devin CLI) as independent reviewers, stateful repository researchers, or single-agent implementers. Use for multi-model opinions and code review, steerable Grok research, full-access delegation, long-running work, reattaching to delegated runs, or showing current subagents in the optional UI. Not for simple questions answerable directly from docs or the current codebase."
+description: "Run external coding agents (Codex, Claude Code, OpenCode, native Grok Build, Antigravity, Gemini, Devin CLI) as independent reviewers, stateful repository researchers, or single-agent implementers. Use for multi-model opinions and code review, steerable Grok research, full-access delegation, long-running work, reattaching to delegated runs, or showing current subagents in the optional UI. Not for simple questions answerable directly from docs or the current codebase."
 ---
 
 # Pragmatic Orchestration
@@ -63,6 +63,7 @@ Use these unless the user asks for a different tradeoff:
 - The opt-in `claude-fable` profile runs Claude Fable 5.1 for demanding long-horizon review or delegation. Its default `low` effort is cost-conscious; override it with `CLAUDE_EFFORT=high`, `xhigh`, or `max` when capability matters more than latency and cost.
 - The opt-in `opencode-go-gemini-4-argon-contributor` profile runs Gemini 4 Argon Contributor through OpenCode Go with `high` effort by default, for both review and delegate. See the Contributor privacy terms in [configuration.md](references/configuration.md).
 - The `devin` profile runs Devin CLI SWE-2-high (`devin` on PATH, `devin auth login`) for review and delegate over `devin acp`. It is disabled by default and never joins the default review pool: select it with `-a devin` or enable the profile. Effort is versioned into the model id, so there is no effort override; `auto`/`queue` steer merges into the running turn and `interrupt` cancels and sends.
+- The opt-in `antigravity` profile runs Gemini 4 Argon High through the Antigravity CLI (`agy` on PATH, signed in). It reviews read-only (write and MCP permissions denied, terminal sandbox on) and delegates **one-shot only**: pass `--one-shot`, because agy print mode has no steering transport. Override with `ANTIGRAVITY_MODEL` / `ANTIGRAVITY_EFFORT`; `agy models` lists the ids. Prefer it over the review-only `gemini-cli` profile for Gemini models.
 - Use `-a devin-gemini-4-argon` for Gemini 4 Argon through Devin CLI in review or delegate. This opt-in profile defaults to `high` through the exact model id `gemini-4-argon-high`.
 
 Choose one review depth; do not run `basic`, `specialists`, `super`, and `ultra` sequentially. Do not call `--list-agents` routinely: enabled profiles are already the default pool for `review ask`, and code-review pass count is fixed by depth.

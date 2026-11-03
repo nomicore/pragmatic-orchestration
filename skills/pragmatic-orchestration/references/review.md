@@ -104,6 +104,7 @@ CLAUDE_EFFORT=medium "$PORCH" review ask \
 | OpenCode | `OPENCODE_MODEL` | `OPENCODE_EFFORT` | `-m`, `--variant`; `none` omits variant |
 | Grok Build | `GROK_MODEL` | `GROK_EFFORT` | `-m`, `--reasoning-effort` |
 | Gemini CLI | `GEMINI_MODEL` | none | `--model` |
+| Antigravity CLI | `ANTIGRAVITY_MODEL` | `ANTIGRAVITY_EFFORT` | `--model`, `--effort` |
 
 In fan-out, an environment override affects every selected profile on that backend. Use a temporary `PORCH_CONFIG` profile when only one same-backend agent should change.
 

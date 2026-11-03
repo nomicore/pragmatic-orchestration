@@ -1,5 +1,12 @@
 {
   "agents": {
+    "antigravity": {
+      "enabled": false,
+      "backend": "antigravity",
+      "model": "gemini-4-argon-high",
+      "role": "lateral",
+      "label": "Antigravity Test"
+    },
     "codex": {
       "enabled": true,
       "backend": "codex-cli",

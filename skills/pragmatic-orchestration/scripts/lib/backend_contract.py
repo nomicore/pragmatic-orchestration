@@ -36,6 +36,7 @@ BACKEND_IDS = (
     "grok-build",
     "gemini-cli",
     "devin-cli",
+    "antigravity",
 )
 
 BACKEND_BINS = {
@@ -45,6 +46,7 @@ BACKEND_BINS = {
     "grok-build": "grok",
     "gemini-cli": "gemini",
     "devin-cli": "devin",
+    "antigravity": "agy",
 }
 
 BIN_ENV = {
@@ -54,6 +56,7 @@ BIN_ENV = {
     "grok-build": "PORCH_BIN_GROK",
     "gemini-cli": "PORCH_BIN_GEMINI",
     "devin-cli": "PORCH_BIN_DEVIN",
+    "antigravity": "PORCH_BIN_ANTIGRAVITY",
 }
 
 MODEL_ENV = {
@@ -63,6 +66,7 @@ MODEL_ENV = {
     "grok-build": "GROK_MODEL",
     "gemini-cli": "GEMINI_MODEL",
     "devin-cli": "DEVIN_MODEL",
+    "antigravity": "ANTIGRAVITY_MODEL",
 }
 
 EFFORT_ENV = {
@@ -70,6 +74,7 @@ EFFORT_ENV = {
     "claude-code": "CLAUDE_EFFORT",
     "opencode": "OPENCODE_EFFORT",
     "grok-build": "GROK_EFFORT",
+    "antigravity": "ANTIGRAVITY_EFFORT",
 }
 
 
@@ -221,6 +226,29 @@ _BACKEND_CAPS: Dict[str, BackendCapabilities] = {
             "turn; interrupt is session/cancel then prompt. ACP_BACKEND is "
             "stripped from the child env. Final text = agent_message_chunk "
             "updates only."
+        ),
+    ),
+    "antigravity": BackendCapabilities(
+        backend="antigravity",
+        transport="stream-json",
+        oneshot_transport="stream-json",
+        steerable_transport="",
+        steerable=False,
+        steer_auto="",
+        steer_queue="",
+        steer_interrupt="",
+        live_queue=False,
+        oneshot=True,
+        supports_delegate=True,
+        final_text_rule="antigravity_result_response",
+        notes=(
+            "Antigravity CLI (agy) print mode. The prompt travels on stdin as one "
+            "stream-json user message ({event:user, message:{content}}), so large "
+            "prompts stay off argv. Final text = result.response; a result with "
+            "status ERROR or a finished_reason is a failure. Review denies "
+            "write_file(*) and mcp(*) through per-run --settings permissions and "
+            "keeps the terminal sandbox; delegate uses --dangerously-skip-permissions. "
+            "Not steerable: delegate requires --one-shot."
         ),
     ),
 }

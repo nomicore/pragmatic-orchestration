@@ -247,6 +247,22 @@ if [[ "$BACKEND" == "gemini-cli" || "$SUPPORTS_DELEGATE" == "false" || "$SUPPORT
     exit $EXIT_CONFIG_ERROR
 fi
 
+# Antigravity print mode has no steering transport (no mid-turn input or
+# cancel protocol), so it runs only on the direct one-shot path.
+if [[ "$BACKEND" == "opencode" && "$STEERABLE" -eq 1 ]]; then
+    oc_bin="${PORCH_BIN_OPENCODE:-opencode}"
+    oc_major="${PORCH_OPENCODE_MAJOR:-$("$oc_bin" --version 2>/dev/null | head -n1 | sed -nE 's/^(opencode )?v?([0-9]+)\.[0-9]+.*/\2/p')}"
+    if [[ "$oc_major" =~ ^[0-9]+$ && "$oc_major" -ge 2 ]]; then
+        # The steer adapter drives the OpenCode 1.x server API; 2.x replaced it.
+        echo "Error: agent '$AGENT_ID' runs OpenCode $oc_major.x, which porch can only run one-shot; use --one-shot" >&2
+        exit $EXIT_USAGE
+    fi
+fi
+if [[ "$BACKEND" == "antigravity" && "$STEERABLE" -eq 1 ]]; then
+    echo "Error: agent '$AGENT_ID' (antigravity) is not steerable; use --one-shot" >&2
+    exit $EXIT_USAGE
+fi
+
 if [[ "$RECOVER_SESSION" -eq 1 && -z "$CONTINUE_RUN" ]]; then
     echo "Error: --recover-session requires --continue-run" >&2
     exit $EXIT_USAGE

@@ -1,6 +1,6 @@
 # Pragmatic Orchestration — Development Guide
 
-Multi-skill repo shipped as one plugin. `skills/<name>/` follows the canonical Agent Skills layout, read by both `npx skills add` (the cross-agent CLI) and Claude Code's plugin install (`/plugin marketplace add` + `/plugin install …@pragmatic-orchestration`). The plugin sees the repo root as itself via `source: "./"` in `marketplace.json`. Current skills: `pragmatic-orchestration` (the `porch` orchestration CLI) and `remote-agents` (dedicated remote Linux/Windows agent hosts).
+Multi-skill repo shipped as one plugin. `skills/<name>/` follows the canonical Agent Skills layout, read by both `npx skills add` (the cross-agent CLI) and Claude Code's plugin install (`/plugin marketplace add` + `/plugin install …@pragmatic-orchestration`). The plugin sees the repo root as itself via `source: "./"` in `marketplace.json`. Current skills: `pragmatic-orchestration` (the `porch` orchestration CLI), `peer-handoff` (task handoff to peer agents for review or competing implementations, built on `porch`; entry point `scripts/handoff`) and `remote-agents` (dedicated remote Linux/Windows agent hosts).
 
 ## Git publishing defaults
 
@@ -13,7 +13,7 @@ explicitly requests one.
 
 - Skill names: `pragmatic-orchestration`, `remote-agents` (SKILL.md frontmatter, directory, state dirs).
 - CLI name: `porch` (`scripts/porch`, `scripts/porch.cmd`); remote-agents has no CLI of its own, its entry point is `scripts/host.sh`.
-- Environment variables: `PORCH_*` for orchestration; `REMOTE_AGENTS_*` for the host skill.
+- Environment variables: `PORCH_*` for orchestration; `PEER_HANDOFF_*` for peer handoff; `REMOTE_AGENTS_*` for the host skill.
 - Historical name: `agents-consilium` / `consilium` — do not reintroduce.
 
 ## Testing
@@ -24,6 +24,7 @@ Offline suite with fake backends — no network, no real provider CLIs:
 cd skills/pragmatic-orchestration
 bash scripts/tests/run.sh          # full harness (shell + python)
 python3 scripts/tests/platform_test.py -v   # native-Python platform checks
+python3 ../peer-handoff/scripts/tests/handoff_test.py -v   # peer-handoff (temp git repo + fake porch)
 ```
 
 Opt-in real-backend smoke tests: `scripts/tests/steer/smoke_real.sh` — see

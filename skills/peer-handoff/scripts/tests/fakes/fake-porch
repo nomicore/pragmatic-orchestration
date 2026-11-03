@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Fake porch for offline peer-handoff tests: logs argv, simulates workers."""
+import json
+import os
+import subprocess
+import sys
+
+argv = sys.argv[1:]
+log = os.environ.get("FAKE_PORCH_LOG")
+stdin = "" if sys.stdin.isatty() else sys.stdin.read()
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "stdin_len": len(stdin)}) + "\n")
+
+
+def opt(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def git(*args):
+    subprocess.run(["git", *args], check=True, capture_output=True)
+
+
+if argv[:1] == ["--list-agents"]:
+    print("<porch-plan>")
+    print('  <agent id="codex" label="Codex" backend="codex-cli" model="m" role="analyst" enabled="true" backend-available="true"/>')
+    print('  <agent id="antigravity" label="AGY" backend="antigravity" model="m" role="lateral" enabled="false" backend-available="true"/>')
+    print("</porch-plan>")
+    sys.exit(0)
+
+if argv[:2] == ["review", "ask"]:
+    brief = open(opt("--prompt-file"), encoding="utf-8").read()
+    print("## Codex\nREVIEW_OK")
+    print("BRIEF_HAS_TASK" if "Add a greeting" in brief else "BRIEF_MISSING_TASK")
+    sys.exit(0)
+
+if argv[:2] == ["review", "code"]:
+    print(f"CODE_REVIEW_OK lines={len(stdin.splitlines())}")
+    sys.exit(0)
+
+if argv[:2] == ["delegate", "status"]:
+    print(json.dumps({"state": "completed", "run_id": argv[2]}))
+    sys.exit(0)
+
+if argv[:2] == ["delegate", "wait"]:
+    print(json.dumps({"final_text": f"ANSWER {argv[2]}"}))
+    sys.exit(0)
+
+if argv[:1] == ["delegate"]:
+    agent = opt("-a")
+    brief = open(opt("--prompt-file"), encoding="utf-8").read()
+    assert os.getcwd() in brief, "brief must name the worker's working root"
+    with open(f"impl_{agent}.txt", "w", encoding="utf-8") as f:
+        f.write(f"implemented by {agent}\n")
+    if "--one-shot" in argv:
+        # Leave the work uncommitted and untracked: collect must still see it.
+        print(f"DONE {agent}")
+    else:
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", f"{agent} work")
+        print(f"run_{agent}-handoff")
+    sys.exit(0)
+
+print("fake porch: unsupported " + " ".join(argv), file=sys.stderr)
+sys.exit(5)

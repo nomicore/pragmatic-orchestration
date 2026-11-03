@@ -576,6 +576,67 @@ def normalize_gemini(obj: Dict[str, Any]) -> tuple[str, Any]:
     return "event", typ
 
 
+_AGY_TEXT_KEYS = ("delta", "text", "content", "response")
+
+
+def _agy_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in _AGY_TEXT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def normalize_antigravity(obj: Dict[str, Any]) -> tuple[str, Any]:
+    """Map Antigravity CLI (agy) stream-json lines to the stream vocabulary.
+
+    Every line is {"event": NAME, NAME: {...}}. Observed in agy 1.4.x:
+    init, step_update (step_type/state per agent step) and a final result
+    whose response is the authoritative answer. A result with status ERROR,
+    an error, or a finished_reason (print_timeout, interrupted, error) means
+    the turn did not finish normally. Answer/thinking delta events are mapped
+    defensively by name; the runner still prefers result.response.
+    """
+    name = str(obj.get("event") or "")
+    payload = obj.get(name) if name else None
+    if name == "result":
+        r = payload if isinstance(payload, dict) else {}
+        status = str(r.get("status") or "").upper()
+        if status == "ERROR" or r.get("error") or r.get("finished_reason"):
+            return "error", r.get("error") or r.get("finished_reason") or "result_error"
+        response = r.get("response")
+        if isinstance(response, str):
+            return "result", response
+        return "end", "result"
+    if name == "init":
+        return "progress", "init"
+    if name == "step_update":
+        st = payload if isinstance(payload, dict) else {}
+        step_type = str(st.get("step_type") or "step")
+        state = str(st.get("state") or "")
+        if step_type == "error_message":
+            return "progress", "error_message"
+        if step_type not in ("user_input", "planner_response", "model_response"):
+            if state in ("RUNNING", "IN_PROGRESS", "PENDING"):
+                return "tool_started", step_type
+            if state in ("DONE", "COMPLETED", "FAILED", "ERROR", "CANCELLED"):
+                return "tool_completed", step_type
+        return "progress", f"{step_type}:{state}" if state else step_type
+    if name in ("thinking", "thought", "thinking_delta", "reasoning"):
+        return "thought", _agy_text(payload)
+    if name in ("text", "text_delta", "message_delta", "response_delta", "assistant", "assistant_delta"):
+        text = _agy_text(payload)
+        return ("text", text) if text else ("progress", name)
+    if name == "error":
+        return "error", _agy_text(payload) or json.dumps(obj)
+    if name:
+        return "progress", name
+    return "event", "antigravity"
+
+
 def stream_to_progress_type(stream_type: str) -> str:
     """Map backend stream names to progress vocabulary (thought/text/end/error)."""
     if stream_type in ("text", "thought", "end", "error", "result"):
@@ -600,7 +661,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Normalize backend streams to porch JSONL")
     ap.add_argument("--backend", required=True, choices=[
         "codex-cli", "claude-code", "opencode", "gemini-cli", "grok-build",
-        "devin-cli", "plain"
+        "devin-cli", "antigravity", "plain"
     ])
     ap.add_argument("--agent-id", required=True)
     ap.add_argument("--model", default="")
@@ -740,6 +801,8 @@ def main() -> int:
                     stream_typ, data = normalize_devin(obj)
                 elif args.backend == "gemini-cli":
                     stream_typ, data = normalize_gemini(obj)
+                elif args.backend == "antigravity":
+                    stream_typ, data = normalize_antigravity(obj)
                 else:
                     # plain backend: each line is answer text
                     if "_plain" in obj:

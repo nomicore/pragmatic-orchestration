@@ -8,7 +8,7 @@
 
 In field use, frontier models such as Astra and Fable cover roughly 2–10× more work with practically no loss of quality when they orchestrate and cheaper executors implement. The best fit is autonomous work lasting hours or days, producing tens to hundreds of thousands of lines of code.
 
-The repo ships two skills in the Agent Skills layout: `pragmatic-orchestration` and `remote-agents`. `porch` provides four modes:
+The repo ships three skills in the Agent Skills layout: `pragmatic-orchestration`, `peer-handoff` and `remote-agents`. `porch` provides four modes:
 
 - **review** — independent opinions or multi-depth code review from several model families at once (read-only).
 - **delegate** — hand a task to one exact agent: steerable by default, detachable, with `wait` / `watch` / `events` / `list` to supervise long-running work (full-access runtime).
@@ -17,11 +17,20 @@ The repo ships two skills in the Agent Skills layout: `pragmatic-orchestration` 
   see the [supported formats and evidence](skills/pragmatic-orchestration/references/session-compatibility.md).
 - **quota** — read remaining Codex / Grok subscription quota.
 
-Supported worker harnesses: Codex CLI, Claude Code, OpenCode, Grok Build, Devin CLI, and Gemini CLI (review only).
+Supported worker harnesses: Codex CLI, Claude Code, OpenCode, Grok Build, Devin CLI, Antigravity CLI (review and one-shot delegate), and Gemini CLI (review only).
 
 The repo also ships **`remote-agents`**: a companion skill for operating dedicated remote Linux/Windows hosts that run these agents — secure VM/OS provisioning, SSH-over-SSM access with no public ingress, the WireGuard/SMB work bridge, `porch` on the remote host, a headless Windows desktop, bounded visual QA, durable worker daemons, and Codex Remote threads. See [skills/remote-agents/SKILL.md](skills/remote-agents/SKILL.md).
 
 Full documentation: [skills/pragmatic-orchestration/README.md](skills/pragmatic-orchestration/README.md) and [SKILL.md](skills/pragmatic-orchestration/SKILL.md).
+
+## Peer handoff
+
+**`peer-handoff`** lets the agent that did the work hand its task to its peers and orchestrate the outcome. `handoff init` packs the task (a Linear issue, a file or text), the project context and what was done into a bundle outside the repository. Then either:
+
+- `handoff review` — peers review the work against the task, read-only, through `porch review`; or
+- `handoff compete` — peers implement the same task independently, each in its own git worktree, through `porch delegate`; `handoff collect` gathers the patches, runs the acceptance checks in every worktree and writes a side-by-side comparison; `handoff adopt` brings the better parts into the original checkout.
+
+The orchestrator judges, merges and owns the single result. See [skills/peer-handoff/SKILL.md](skills/peer-handoff/SKILL.md) and [skills/peer-handoff/README.md](skills/peer-handoff/README.md).
 
 ## Optional live UI
 

@@ -1,0 +1,50 @@
+#!/bin/bash
+# Fake Antigravity CLI (agy) for offline tests. Records argv + stdin and emits
+# the stream-json shape observed from agy 1.4.x print mode:
+#   {"event":"init",...} {"event":"step_update",...} {"event":"result",...}
+set -euo pipefail
+LOG="${PORCH_FAKE_ARGV_LOG:-/dev/null}"
+STDIN_BODY="$(cat)"
+STDIN_BODY="$STDIN_BODY" python3 -c '
+import json, os, sys
+print(json.dumps({
+    "bin": "agy",
+    "argv": sys.argv[1:],
+    "stdin": os.environ.get("STDIN_BODY", ""),
+    "cwd": os.getcwd(),
+    "has_FULL_PROMPT": "FULL_PROMPT" in os.environ,
+}))
+' -- "$@" >> "$LOG"
+
+emit() { printf '%s\n' "$1"; }
+emit '{"event":"init","conversation_id":"fake","init":{"cwd":"/tmp","tools":["view_file","run_command"],"permission_mode":"request-review"}}'
+emit '{"event":"step_update","step_update":{"conversation_id":"fake","step_index":0,"state":"DONE","step_type":"user_input"}}'
+
+MODE="${PORCH_FAKE_AGY_MODE:-ok}"
+case "$MODE" in
+  error)
+    emit '{"event":"step_update","step_update":{"conversation_id":"fake","step_index":1,"state":"DONE","step_type":"error_message"}}'
+    echo 'AGY_ERROR: {"short_error":"PERMISSION_DENIED (code 403)"}' >&2
+    emit '{"event":"result","result":{"conversation_id":"fake","status":"ERROR","response":"","error":"PERMISSION_DENIED","finished_reason":"error"}}'
+    exit 3
+    ;;
+  timeout)
+    # Partial answer cut off by --print-timeout; CLI exit 0 must not pass.
+    emit '{"event":"result","result":{"conversation_id":"fake","status":"DONE","response":"PARTIAL","finished_reason":"print_timeout"}}'
+    exit 0
+    ;;
+  empty)
+    emit '{"event":"result","result":{"conversation_id":"fake","status":"DONE","response":""}}'
+    exit 0
+    ;;
+  denied)
+    emit '{"event":"result","result":{"conversation_id":"fake","status":"SUCCESS","response":"","denied_actions":[{"action":"read_file","display_name":"ReadFile"}]}}'
+    exit 0
+    ;;
+  *)
+    emit '{"event":"step_update","step_update":{"conversation_id":"fake","step_index":1,"state":"RUNNING","step_type":"run_command"}}'
+    emit '{"event":"step_update","step_update":{"conversation_id":"fake","step_index":1,"state":"DONE","step_type":"run_command"}}'
+    emit '{"event":"result","result":{"conversation_id":"fake","status":"DONE","response":"FAKE_AGY_OK","num_turns":1}}'
+    exit 0
+    ;;
+esac
