@@ -18,10 +18,10 @@ form your own view.
 
 ## Where the work is
 
-- Repository root: `{{REPO}}` (the reviewed commit is checked out)
+- Repository root: `{{REPO}}` ({{CHECKOUT_STATE}})
 - Base commit: `{{BASE_SHA}}`
-- Reviewed commit: `{{HEAD_SHA}}` on branch `{{BRANCH}}`
-- See the change with `git diff {{BASE_SHA}}..{{HEAD_SHA}}`; the same diff is
+- Reviewed commit: `{{HEAD_SHA}}` on branch `{{BRANCH}}`{{UNCOMMITTED_NOTE}}
+- See the change with `{{DIFF_CMD}}`; the same diff is
   saved at `{{PATCH_PATH}}`.
 
 {{RELEVANT_FILES}}

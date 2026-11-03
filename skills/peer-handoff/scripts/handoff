@@ -12,7 +12,11 @@ comparison the orchestrator uses to pick the best parts.
 Bundles live outside the repository, under $PEER_HANDOFF_HOME
 (default ~/.peer-handoff), so nothing about the task lands in the repo.
 
-Commands: init, review, compete, status, collect, adopt, cleanup, list.
+Every review records each peer's tokens and cost (see usage.py); `cost`
+sums them per bundle and `report` writes a round record with metrics of the
+change, the peers that took part and what each one cost.
+
+Commands: init, review, cost, report, compete, status, collect, adopt, cleanup, list.
 Run `handoff <command> --help` for options. Standard library only.
 """
 from __future__ import annotations
@@ -32,6 +36,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import usage  # noqa: E402  (sibling module, standard library only)
+
 SKILL_DIR = SCRIPT_DIR.parent
 PROMPTS_DIR = SKILL_DIR / "prompts"
 SIBLING_PORCH = SKILL_DIR.parent / "pragmatic-orchestration" / "scripts" / "porch"
@@ -63,7 +70,9 @@ def slugify(text: str, limit: int = 40) -> str:
 def run(argv: Sequence[str], cwd: Optional[Path] = None, check: bool = True,
         input_text: Optional[str] = None, timeout: Optional[int] = None,
         env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    proc = subprocess.run(list(argv), cwd=str(cwd) if cwd else None, text=True,
+    # No input: give the child /dev/null so it never waits on an inherited stdin.
+    stdin = subprocess.DEVNULL if input_text is None else None
+    proc = subprocess.run(list(argv), cwd=str(cwd) if cwd else None, text=True, stdin=stdin,
                           input=input_text, capture_output=True, timeout=timeout, env=env)
     if check and proc.returncode != 0:
         raise HandoffError(f"command failed ({proc.returncode}): {shlex.join(argv)}\n{proc.stderr.strip()}")
@@ -137,10 +146,21 @@ def render_template(name: str, values: Dict[str, str]) -> str:
     return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), ""), text)
 
 
+def agent_info() -> Dict[str, Dict[str, str]]:
+    """Map agent id → {backend, model, enabled} from `porch --list-agents`."""
+    out = run([porch_bin(), "--list-agents"], check=False).stdout
+    info: Dict[str, Dict[str, str]] = {}
+    for m in re.finditer(r"<agent ([^>]*)/?>", out):
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
+        if "id" in attrs:
+            info[attrs["id"]] = {"backend": attrs.get("backend", ""), "model": attrs.get("model", ""),
+                                 "enabled": attrs.get("enabled", "")}
+    return info
+
+
 def agent_backends() -> Dict[str, str]:
     """Map agent id → backend from `porch --list-agents`."""
-    out = run([porch_bin(), "--list-agents"], check=False).stdout
-    return {m.group(1): m.group(2) for m in re.finditer(r'<agent id="([^"]+)"[^>]*backend="([^"]+)"', out)}
+    return {k: v["backend"] for k, v in agent_info().items()}
 
 
 ONE_SHOT_BACKENDS = {"antigravity"}  # porch delegate has no steering transport for these
@@ -153,7 +173,8 @@ def opencode_is_one_shot() -> bool:
         return forced.isdigit() and int(forced) >= 2
     binary = os.environ.get("PORCH_BIN_OPENCODE", "opencode")
     try:
-        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20).stdout
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20,
+                             stdin=subprocess.DEVNULL).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     first = out.strip().splitlines()[0] if out.strip() else ""
@@ -318,9 +339,17 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # What the orchestrator did.
     log = git(repo, "log", "--reverse", "--format=- %h %s", f"{base_sha}..{head_sha}").strip()
-    stat = git(repo, "diff", "--stat", f"{base_sha}..{head_sha}").strip()
-    patch = git(repo, "diff", "--binary", f"{base_sha}..{head_sha}")
     dirty = git(repo, "status", "--porcelain").strip()
+    uncommitted = bool(args.include_uncommitted and dirty)
+    if args.include_uncommitted and args.head != "HEAD":
+        raise HandoffError("--include-uncommitted works only with --head HEAD")
+    if uncommitted:
+        # Base → working tree, plus untracked files: the work as it is on disk.
+        stat = git(repo, "diff", "--stat", base_sha).strip()
+        patch = git(repo, "diff", "--binary", base_sha) + untracked_patch(repo)
+    else:
+        stat = git(repo, "diff", "--stat", f"{base_sha}..{head_sha}").strip()
+        patch = git(repo, "diff", "--binary", f"{base_sha}..{head_sha}")
     notes = ""
     if args.notes_file:
         notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8")
@@ -330,13 +359,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         f"- **Repository root:** `{repo}`",
         f"- **Branch:** `{branch}`",
         f"- **Base:** `{base_ref}` @ `{base_sha[:12]}`",
-        f"- **Head:** `{head_sha[:12]}`",
+        f"- **Head:** `{head_sha[:12]}`" + (" plus uncommitted changes in the working tree" if uncommitted else ""),
         "",
         "### Commits since base", "", log or "_No commits yet._", "",
         "### Diffstat", "", f"```\n{stat}\n```" if stat else "_No committed changes._", "",
         "### Implementer's notes", "", notes.strip() or "_None._", "",
     ])
-    if dirty:
+    if uncommitted:
+        work_md += ("\n> The work includes uncommitted changes in the working tree; `ours.patch` is "
+                    "base → working tree. Review the files as they are on disk.\n")
+    elif dirty:
         work_md += "\n> Uncommitted changes existed when the bundle was created; they are not in `ours.patch`.\n"
 
     checks = list(args.check or [])
@@ -344,7 +376,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "version": 1, "id": bundle_id, "created": now_iso(), "repo": str(repo),
         "base_ref": base_ref, "base_sha": base_sha, "head": args.head, "head_sha": head_sha,
         "branch": branch, "task_sources": task_sources, "context_sources": ctx_sources,
-        "checks": checks, "runs": {}, "reviews": [],
+        "checks": checks, "runs": {}, "reviews": [], "uncommitted": uncommitted,
     }
     write(bundle / "task.md", "\n\n".join(task_parts))
     write(bundle / "context.md", context_md)
@@ -352,10 +384,20 @@ def cmd_init(args: argparse.Namespace) -> int:
     write(bundle / "ours.patch", patch)
     save_manifest(bundle, manifest)
     write_briefs(bundle, manifest)
-    if dirty and not args.quiet:
-        print("warning: the working tree has uncommitted changes; commit them first so peers see them", file=sys.stderr)
+    if dirty and not uncommitted and not args.quiet:
+        print("warning: the working tree has uncommitted changes; commit them first so peers see them, "
+              "or pass --include-uncommitted", file=sys.stderr)
     print(bundle)
     return 0
+
+
+def untracked_patch(repo: Path) -> str:
+    out = []
+    files = git(repo, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    for rel in filter(None, files):
+        out.append(run(["git", "-C", str(repo), "diff", "--binary", "--no-index", "--", "/dev/null", rel],
+                       check=False).stdout)
+    return "".join(out)
 
 
 def checks_md(checks: Sequence[str]) -> str:
@@ -387,7 +429,16 @@ def write_briefs(bundle: Path, manifest: Dict[str, Any]) -> None:
         "CHECKS": checks_md(manifest.get("checks") or []),
         "PATCH_PATH": str(bundle / "ours.patch"),
         "RELEVANT_FILES": relevant_files_block(bundle),
+        "CHECKOUT_STATE": "the reviewed commit is checked out",
+        "UNCOMMITTED_NOTE": "",
+        "DIFF_CMD": f"git diff {manifest['base_sha']}..{manifest['head_sha']}",
     }
+    if manifest.get("uncommitted"):
+        common.update({
+            "CHECKOUT_STATE": "the reviewed commit is checked out, with the uncommitted work on top",
+            "UNCOMMITTED_NOTE": ", plus uncommitted changes in the working tree that are part of the work",
+            "DIFF_CMD": f"git diff {manifest['base_sha']}` (base to working tree) and `git status --short",
+        })
     write(bundle / "brief-review.md", render_template("review-brief.md", common))
     # The implement brief is completed per worker (working root) at launch time.
     write(bundle / "brief-implement.md", render_template("implement-brief.md", dict(common, WORKTREE="{{WORKTREE}}")))
@@ -405,6 +456,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     review_root = repo
     review_wt: Optional[Path] = None
     brief = bundle / "brief-review.md"
+    if manifest.get("uncommitted") and current != head and not args.allow_head_mismatch:
+        raise HandoffError(f"{repo} moved to {current[:12]}; the bundle reviews uncommitted work on "
+                           f"{head[:12]}. Check that commit out again, or pass --allow-head-mismatch.")
     if current != head and not args.allow_head_mismatch:
         # The user's checkout moved on. Review from a throwaway detached
         # worktree at the reviewed commit instead of touching their checkout.
@@ -428,21 +482,197 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"cd {shlex.quote(str(review_root))} && {shlex.join(argv)}" + (" < ours.patch" if stdin else ""))
         return 0
+    # Keep porch's raw streams with the bundle: they carry each peer's token usage.
+    run_dir = bundle / "runs" / f"{stamp}-{args.kind}"
+    env = dict(os.environ, PORCH_RUN_DIR=str(run_dir), PORCH_SAVE_OUTPUTS="1")
     try:
         proc = subprocess.run(argv, cwd=str(review_root), text=True, input=stdin if stdin is not None else "",
-                              stdout=subprocess.PIPE, stderr=None)
+                              stdout=subprocess.PIPE, stderr=None, env=env)
     finally:
         if review_wt is not None:
             git(repo, "worktree", "remove", "--force", str(review_wt), check=False)
     out = bundle / "reviews" / f"{stamp}-{args.kind}.md"
     write(out, proc.stdout)
+    rows = review_cost_rows(run_dir)
+    usage_file = bundle / "reviews" / f"{stamp}-{args.kind}.usage.json"
+    write(usage_file, json.dumps({"at": now_iso(), "kind": args.kind, "rows": rows,
+                                  "summary": usage.summarize(rows)}, indent=2) + "\n")
+    # Re-read: another review of this bundle may have finished while this one ran.
+    manifest = load_manifest(bundle)
     manifest.setdefault("reviews", []).append({"kind": args.kind, "agents": args.agents or "enabled",
-                                               "file": str(out), "exit": proc.returncode, "at": now_iso()})
+                                               "file": str(out), "usage": str(usage_file), "run_dir": str(run_dir),
+                                               "exit": proc.returncode, "at": now_iso()})
     save_manifest(bundle, manifest)
     sys.stdout.write(proc.stdout)
+    if rows:
+        print("\n[peer-handoff] cost of this review:\n" + usage.table_md(rows), file=sys.stderr)
     print(f"\n[peer-handoff] review saved: {out} (porch exit {proc.returncode})", file=sys.stderr)
     # porch: 0 all ok, 2 partial — both carry usable reports.
     return 0 if proc.returncode in (0, 2) else proc.returncode
+
+
+def review_cost_rows(run_dir: Path) -> List[Dict[str, Any]]:
+    """Usage and cost per agent, from the raw streams porch left in run_dir."""
+    raw_dir = run_dir / "raw"
+    if not raw_dir.is_dir():
+        return []
+    info = agent_info()
+    pricing = usage.load_pricing_file()
+    catalogue = usage.load_catalogue()
+    rows = []
+    started = usage.run_started(run_dir)
+    for raw in sorted(raw_dir.glob("*.jsonl")):
+        agent_id = raw.stem
+        while agent_id not in info and "." in agent_id:  # review code writes <agent>.<pass>.jsonl
+            agent_id = agent_id.rsplit(".", 1)[0]
+        meta = info.get(agent_id, {})
+        rows.append(usage.cost_row(agent_id, meta.get("backend", ""), meta.get("model", ""),
+                                   raw, pricing, catalogue, started))
+    return merge_rows(rows)
+
+
+def merge_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One row per agent and model: multi-pass reviews leave one stream per
+    pass, and a bundle can hold several reviews by the same peer."""
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for r in rows:
+        key = (r["agent"], r["model"])
+        m = merged.get(key)
+        if m is None:
+            merged[key] = json.loads(json.dumps(r))
+            continue
+        for k in m["tokens"]:
+            m["tokens"][k] += r["tokens"][k]
+        m["calls"] += r["calls"]
+        m["cost_usd"] = None if m["cost_usd"] is None or r["cost_usd"] is None else round(m["cost_usd"] + r["cost_usd"], 6)
+        m["duration_s"] = (m.get("duration_s") or 0) + (r.get("duration_s") or 0)
+        if r["calls"] and r["price_source"] not in m["price_source"].split(" + "):
+            m["price_source"] = r["price_source"] if not m["calls"] - r["calls"] else f"{m['price_source']} + {r['price_source']}"
+    return list(merged.values())
+
+
+def bundle_cost_rows(bundle: Path, manifest: Dict[str, Any], only: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for rec in manifest.get("reviews", []):
+        uf = rec.get("usage")
+        if not uf or not Path(uf).is_file():
+            continue
+        if only and not any(Path(uf).name.startswith(o) for o in only):
+            continue
+        rows += json.loads(Path(uf).read_text(encoding="utf-8")).get("rows", [])
+    return merge_rows(rows)
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    rows = bundle_cost_rows(bundle, manifest, args.review)
+    if args.json:
+        print(json.dumps({"rows": rows, "summary": usage.summarize(rows)}, indent=2))
+    else:
+        print(usage.table_md(rows) if rows else "No recorded usage in this bundle.")
+    return 0
+
+
+# ---------------------------------------------------------------- report
+
+SIZE_CLASSES = ((10, "XS"), (50, "S"), (250, "M"), (1000, "L"))
+
+
+def change_metrics(bundle: Path) -> Dict[str, Any]:
+    """Describe the reviewed change so rounds of different size can be compared."""
+    st = patch_stats((bundle / "ours.patch").read_text(encoding="utf-8"))
+    files = st["files"]
+    tests = [f for f in files if re.search(r"(^|/)(tests?|spec|__tests__)/|(_test|\.test|\.spec)\.|(^|/)test_", f)]
+    components = sorted({"/".join(Path(f).parts[:-1][:3]) or "." for f in files if f not in tests})
+    changed = st["added"] + st["removed"]
+    size = next((label for limit, label in SIZE_CLASSES if changed <= limit), "XL")
+    task = (bundle / "task.md").read_text(encoding="utf-8") if (bundle / "task.md").is_file() else ""
+    criteria = len(re.findall(r"^\s*[-*]\s*(\[[ xX]\]|☐|☑)", task, flags=re.M))
+    return {
+        "files": len(files), "source_files": len(files) - len(tests), "test_files": len(tests),
+        "lines_added": st["added"], "lines_removed": st["removed"], "lines_changed": changed,
+        "size_class": size, "components": components, "task_words": len(task.split()),
+        "acceptance_criteria": criteria,
+    }
+
+
+AMBIGUITY_SCALE = {
+    1: "precise: exact behaviour and acceptance criteria",
+    2: "clear: small gaps a reviewer fills from the code",
+    3: "partly open: some requirements need interpretation",
+    4: "vague: goal known, behaviour largely undefined",
+    5: "exploratory: the task is to find out what to do",
+}
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    rows = bundle_cost_rows(bundle, manifest, args.review)
+    summary = usage.summarize(rows)
+    m = change_metrics(bundle)
+    task_title = ""
+    task_md = bundle / "task.md"
+    if task_md.is_file():
+        first = task_md.read_text(encoding="utf-8").strip().splitlines()[:1]
+        task_title = first[0].lstrip("# ").strip() if first else ""
+    title = args.title or task_title or manifest["id"]
+    per100 = (summary["all_list_price_usd"] / m["lines_changed"] * 100) if m["lines_changed"] else None
+    amb = args.ambiguity
+    review_dates = [r.get("at", "")[:10] for r in manifest.get("reviews", [])
+                    if r.get("at") and (not args.review or any(Path(r.get("file", "")).name.startswith(o) for o in args.review))]
+    date = args.date or (max(review_dates) if review_dates else dt.date.today().isoformat())
+    record = {
+        "date": date, "title": title, "bundle": manifest["id"],
+        "repo": Path(manifest["repo"]).name, "branch": manifest.get("branch"),
+        "base": manifest.get("base_sha", "")[:12], "head": manifest.get("head_sha", "")[:12],
+        "uncommitted": bool(manifest.get("uncommitted")), "pr": args.pr, "ticket": args.ticket,
+        "ambiguity": amb, "metrics": m, "peers": [r["agent"] for r in rows], "cost": summary,
+        "cost_per_100_changed_lines_usd": round(per100, 4) if per100 is not None else None,
+    }
+    lines = [f"# Peer review round: {title}", "",
+             f"- **Date:** {record['date']}"]
+    if args.ticket:
+        lines.append(f"- **Ticket:** {args.ticket}")
+    if args.pr:
+        lines.append(f"- **Pull request:** {args.pr}")
+    lines += [f"- **Repository / branch:** {record['repo']} / `{record['branch']}`",
+              f"- **Reviewed:** `{record['base']}..{record['head']}`" + (" plus uncommitted changes" if record["uncommitted"] else ""),
+              f"- **Bundle:** `{manifest['id']}`", "",
+              "## The change", "",
+              "| Metric | Value |", "|---|---|",
+              f"| Size class | **{m['size_class']}** ({m['lines_changed']} changed lines: +{m['lines_added']} / -{m['lines_removed']}) |",
+              f"| Files | {m['files']} ({m['source_files']} source, {m['test_files']} test) |",
+              f"| Components | {len(m['components'])}: " + ", ".join(f"`{c}`" for c in m["components"]) + " |",
+              f"| Task | {m['task_words']} words, {m['acceptance_criteria']} acceptance criteria |",
+              f"| Ambiguity | " + (f"{amb}/5 ({AMBIGUITY_SCALE.get(amb, '')})" if amb else "not rated") + " |",
+              "", "## Peers and cost", "", usage.table_md(rows) if rows else "_No recorded usage._", ""]
+    if per100 is not None:
+        lines += [f"List-price cost per 100 changed lines: {usage.fmt_usd(per100)}.", ""]
+    lines += ["## Findings", "", "_Orchestrator: one row per finding: who raised it, verified or not, verdict._", "",
+              "| # | Finding | Raised by | Verified | Verdict |", "|---|---|---|---|---|", "",
+              "## Peer value", "", "_Orchestrator: which peers found something real, which added noise._", "",
+              "<!-- round-record", json.dumps(record, indent=2), "-->", ""]
+    text = "\n".join(lines)
+    if args.out:
+        out = Path(args.out).expanduser()
+        write(out, text)
+        print(out)
+    else:
+        sys.stdout.write(text)
+    if args.ledger:
+        ledger = Path(args.ledger).expanduser()
+        if not ledger.is_file():
+            write(ledger, "| Date | Round | Size | Ambiguity | Peers | Spent | Plan equiv. | Record |\n"
+                          "|---|---|---|---|---|---|---|---|\n")
+        link = os.path.relpath(Path(args.out).expanduser(), ledger.parent) if args.out else ""
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write(f"| {record['date']} | {title} | {m['size_class']} ({m['lines_changed']}) | {amb or '-'} | "
+                     f"{len(rows)} | {usage.fmt_usd(summary['metered_usd'])} | "
+                     f"{usage.fmt_usd(summary['subscription_equiv_usd'])} | "
+                     + (f"[record]({link})" if link else "") + " |\n")
+    return 0
 
 
 # ---------------------------------------------------------------- compete
@@ -813,6 +1043,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--notes-file", help="file with the implementer's notes")
     p.add_argument("--check", action="append", metavar="CMD", help="acceptance command run by collect (repeatable)")
     p.add_argument("--slug", help="short name for the bundle id")
+    p.add_argument("--include-uncommitted", action="store_true",
+                   help="hand over the working tree as it is (base → working tree, untracked files included)")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_init)
 
@@ -828,6 +1060,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="review the checkout as it is, even if it is not at the bundle's head commit")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("cost", help="tokens and cost of the bundle's reviews, per peer")
+    p.add_argument("bundle")
+    p.add_argument("--review", action="append", metavar="STAMP",
+                   help="only reviews whose file name starts with STAMP (repeatable)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_cost)
+
+    p = sub.add_parser("report", help="write a round record: change metrics, peers, cost per peer")
+    p.add_argument("bundle")
+    p.add_argument("--out", help="write the record here (default: stdout)")
+    p.add_argument("--ledger", help="append a summary row to this Markdown table")
+    p.add_argument("--review", action="append", metavar="STAMP",
+                   help="only reviews whose file name starts with STAMP (default: all in the bundle)")
+    p.add_argument("--title", help="round title (default: the task's first heading)")
+    p.add_argument("--date", help="round date YYYY-MM-DD (default: date of the latest included review)")
+    p.add_argument("--ticket", help="ticket reference or link")
+    p.add_argument("--pr", help="pull request link")
+    p.add_argument("--ambiguity", type=int, choices=range(1, 6), metavar="1-5",
+                   help="how open the task is: 1 precise … 5 exploratory")
+    p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("compete", help="independent implementations, one git worktree per agent")
     p.add_argument("bundle")

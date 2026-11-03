@@ -24,7 +24,9 @@ apply to every peer you launch here.
 
 ## 1. Build the bundle
 
-Commit your work first; peers see committed state only. Then, from the repository:
+Commit your work first, or pass `--include-uncommitted` to hand over the
+working tree as it is (`ours.patch` is then base → working tree, untracked
+files included, and reviews run in that checkout). Then, from the repository:
 
 ```bash
 BUNDLE=$("$HANDOFF" init \
@@ -73,6 +75,39 @@ launching anything: it is exactly what peers receive.
 - Reports are saved under `$BUNDLE/reviews/`. Judge every finding by evidence
   and task impact (`review-acceptance.md`): fix, verify, defer or dismiss.
   Agreement between reviewers is a signal, not proof.
+- Every review also records what each peer cost, in
+  `$BUNDLE/reviews/<stamp>-<kind>.usage.json`, and prints the table. See
+  section 2c.
+
+## 2c. Cost of a round
+
+porch keeps each peer's raw stream; `review` reads the tokens from it and
+prices them:
+
+- OpenCode and Claude Code report a cost themselves; that number is used.
+- Codex, Antigravity and others report tokens only; they are priced with
+  OpenRouter's public list prices (input, cached input, output; cached for a
+  day under `$PEER_HANDOFF_HOME/cache/`).
+- `metered` peers cost real money per token. `subscription` peers (Codex and
+  Claude Code by default, OpenCode Go models) are covered by a flat plan: their
+  figure is a list-price equivalent for comparing peers, not money spent.
+- Overrides go in `$PEER_HANDOFF_HOME/pricing.json`: `billing` per agent id or
+  backend, `models` (porch model → OpenRouter id), `prices` (USD per million
+  tokens for `input`, `cached`, `output`).
+
+```bash
+"$HANDOFF" cost "$BUNDLE"                       # per peer, all reviews in the bundle
+"$HANDOFF" report "$BUNDLE" --out rounds/2026-11-03-eng-123-r1.md \
+  --ledger rounds/README.md --ticket ENG-123 --pr <url> --ambiguity 2
+```
+
+`report` writes a round record: size of the change (changed lines, size class
+XS–XL, files, components, test files), the task (words, acceptance criteria),
+the ambiguity you rate from 1 (precise) to 5 (exploratory), each peer's
+tokens, time and cost, totals, and cost per 100 changed lines. It leaves a
+findings table and a "peer value" section for you to fill in after verifying,
+and appends a summary row to the ledger. Keep records in the project that owns
+the work; they name its code and findings.
 
 ## 2b. Independent implementations
 

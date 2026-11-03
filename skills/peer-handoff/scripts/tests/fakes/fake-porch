@@ -25,10 +25,31 @@ if argv[:1] == ["--list-agents"]:
     print("<porch-plan>")
     print('  <agent id="codex" label="Codex" backend="codex-cli" model="m" role="analyst" enabled="true" backend-available="true"/>')
     print('  <agent id="antigravity" label="AGY" backend="antigravity" model="m" role="lateral" enabled="false" backend-available="true"/>')
+    print('  <agent id="oc-kimi-k3.1" label="Kimi" backend="opencode" model="openrouter/moonshotai/kimi-k3.1-pro" role="lateral" enabled="false" backend-available="true"/>')
     print("</porch-plan>")
     sys.exit(0)
 
+
+def write_raw_streams():
+    """Like porch: one raw stream per agent under $PORCH_RUN_DIR/raw."""
+    run_dir = os.environ.get("PORCH_RUN_DIR")
+    if not run_dir:
+        return
+    raw = os.path.join(run_dir, "raw")
+    os.makedirs(raw, exist_ok=True)
+    with open(os.path.join(run_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"mode": "review-ask", "started_at": "2026-01-01T00:00:00Z"}, f)
+    with open(os.path.join(raw, "codex.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 1_200_000, "cached_input_tokens": 1_000_000, "output_tokens": 10_000}}) + "\n")
+    with open(os.path.join(raw, "oc-kimi-k3.1.jsonl"), "w", encoding="utf-8") as f:
+        for cost in (0.25, 0.5):
+            f.write(json.dumps({"type": "step_finish", "part": {"cost": cost, "tokens": {
+                "input": 1000, "output": 100, "reasoning": 50, "cache": {"read": 2000}}}}) + "\n")
+
+
 if argv[:2] == ["review", "ask"]:
+    write_raw_streams()
     brief = open(opt("--prompt-file"), encoding="utf-8").read()
     print("## Codex\nREVIEW_OK")
     print("BRIEF_HAS_TASK" if "Add a greeting" in brief else "BRIEF_MISSING_TASK")

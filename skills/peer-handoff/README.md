@@ -48,8 +48,10 @@ answers by hand.
 
 | Command | What it does |
 |---|---|
-| `handoff init` | Build a bundle from the task (`--task-linear`, `--task-file`, `--task-text`), context (`--context-file`, `--context-note`), notes and acceptance checks |
-| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default) or porch diff review (`--kind code --depth …`) |
+| `handoff init` | Build a bundle from the task (`--task-linear`, `--task-file`, `--task-text`), context (`--context-file`, `--context-note`), notes and acceptance checks; `--include-uncommitted` hands over the working tree as it is |
+| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default) or porch diff review (`--kind code --depth …`); records each peer's tokens and cost |
+| `handoff cost BUNDLE` | Tokens, time and cost per peer across the bundle's reviews (`--json`) |
+| `handoff report BUNDLE` | Round record: change size and components, task size, ambiguity, cost per peer; `--ledger` appends a summary row |
 | `handoff compete BUNDLE -a a,b,c` | One worktree + branch per agent at the base commit; launch each peer on the implement brief |
 | `handoff status BUNDLE` | State of every competing worker |
 | `handoff collect BUNDLE` | Patches (committed, uncommitted and untracked), final answers, check results; writes `comparison.md` |
@@ -70,6 +72,7 @@ Worktrees for competing peers sit inside the bundle.
 | `PEER_HANDOFF_HOME` | Bundle root (default `~/.peer-handoff`) |
 | `PEER_HANDOFF_PORCH` | porch executable (default: the sibling skill, then `porch` on PATH) |
 | `PEER_HANDOFF_CHECK_TIMEOUT` | Seconds per acceptance command in `collect` (default 1800) |
+| `PEER_HANDOFF_PRICES_URL` | Price catalogue for peers that report tokens only (default: OpenRouter's public model list) |
 | `LINEAR_API_KEY` | Linear personal API key for `--task-linear` |
 
 ## Tests

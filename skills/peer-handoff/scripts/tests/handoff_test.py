@@ -47,6 +47,11 @@ class HandoffTests(unittest.TestCase):
         self.env = dict(os.environ, PEER_HANDOFF_HOME=str(self.tmp / "home"),
                         PEER_HANDOFF_PORCH=str(FAKE_PORCH), FAKE_PORCH_LOG=str(self.log))
         self.env.pop("LINEAR_API_KEY", None)
+        prices = self.tmp / "prices.json"
+        prices.write_text(json.dumps({"data": [
+            {"id": "openai/m", "pricing": {"prompt": "0.000002", "completion": "0.00001",
+                                           "input_cache_read": "0.0000001"}}]}))
+        self.env["PEER_HANDOFF_PRICES_URL"] = prices.as_uri()
 
     def handoff(self, *args, expect=0):
         res = subprocess.run([sys.executable, str(HANDOFF), *args], cwd=self.repo, env=self.env,
@@ -118,6 +123,79 @@ class HandoffTests(unittest.TestCase):
         manifest = json.loads((bundle / "manifest.json").read_text())
         self.assertEqual(len(manifest["reviews"]), 2)
         self.assertTrue(all(Path(r["file"]).is_file() for r in manifest["reviews"]))
+
+    def test_review_records_usage_and_cost_per_peer(self):
+        bundle = self.init()
+        res = self.handoff("review", str(bundle), "-a", "codex,oc-kimi-k3.1")
+        self.assertIn("cost of this review", res.stderr)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        usage_file = Path(manifest["reviews"][-1]["usage"])
+        data = json.loads(usage_file.read_text())
+        rows = {r["agent"]: r for r in data["rows"]}
+        codex = rows["codex"]
+        # 200k uncached at $2/M + 1M cached at $0.1/M + 10k output at $10/M.
+        self.assertEqual(codex["tokens"]["input"], 200_000)
+        self.assertEqual(codex["tokens"]["cached"], 1_000_000)
+        self.assertAlmostEqual(codex["cost_usd"], 0.6, places=6)
+        self.assertEqual(codex["billing"], "subscription")
+        self.assertEqual(codex["price_source"], "openrouter:openai/m")
+        kimi = rows["oc-kimi-k3.1"]
+        self.assertAlmostEqual(kimi["cost_usd"], 0.75, places=6)
+        self.assertEqual(kimi["price_source"], "reported by backend")
+        self.assertEqual(kimi["tokens"]["output"], 300)
+        self.assertEqual(data["summary"]["metered_usd"], 0.75)
+        self.assertEqual(data["summary"]["subscription_equiv_usd"], 0.6)
+        out = self.handoff("cost", str(bundle)).stdout
+        self.assertIn("| oc-kimi-k3.1 |", out)
+        self.assertIn("Spent (metered):** $0.750", out)
+
+    def test_report_writes_round_record_and_ledger(self):
+        bundle = self.init()
+        self.handoff("review", str(bundle), "-a", "codex,oc-kimi-k3.1")
+        rec = self.tmp / "rounds" / "r1.md"
+        ledger = self.tmp / "rounds" / "README.md"
+        self.handoff("report", str(bundle), "--out", str(rec), "--ledger", str(ledger),
+                     "--ticket", "ENG-1", "--ambiguity", "2")
+        text = rec.read_text()
+        self.assertIn("# Peer review round: ENG-1: Add a greeting", text)
+        self.assertIn("**XS** (2 changed lines", text)
+        self.assertIn("2/5 (clear", text)
+        self.assertIn("| codex |", text)
+        record = json.loads(text.split("<!-- round-record", 1)[1].split("-->", 1)[0])
+        self.assertEqual(record["metrics"]["files"], 1)
+        self.assertEqual(sorted(record["peers"]), ["codex", "oc-kimi-k3.1"])
+        rows = ledger.read_text().splitlines()
+        self.assertEqual(len(rows), 3)
+        self.assertIn("[record](r1.md)", rows[-1])
+
+    def test_extract_usage_antigravity_sums_model_calls(self):
+        raw = self.tmp / "agy.jsonl"
+        raw.write_text("\n".join(json.dumps({"step_update": {"usage": u}}) for u in (
+            {"input_tokens": 100, "output_tokens": 10, "thinking_tokens": 5, "cache_read_tokens": 1000},
+            {"input_tokens": 50, "output_tokens": 20, "thinking_tokens": 0, "cache_read_tokens": 2000},
+        )) + "\n")
+        u = handoff.usage.extract_usage(raw, "antigravity")
+        self.assertEqual((u["input"], u["cached"], u["output"], u["calls"]), (150, 3000, 35, 2))
+        self.assertIsNone(u["reported_cost"])
+
+    def test_init_include_uncommitted_hands_over_the_working_tree(self):
+        (self.repo / "app.py").write_text("print('hello, uncommitted')\n")
+        (self.repo / "new_module.py").write_text("X = 1\n")
+        bundle = self.init("--include-uncommitted")
+        patch = (bundle / "ours.patch").read_text()
+        self.assertIn("hello, uncommitted", patch)
+        self.assertIn("new_module.py", patch)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertTrue(manifest["uncommitted"])
+        self.assertIn("uncommitted changes in the working tree", (bundle / "brief-review.md").read_text())
+        # Reviews run in the checkout itself, which holds the uncommitted work.
+        self.handoff("review", str(bundle), "-a", "codex")
+        call = [json.loads(l) for l in self.log.read_text().splitlines()][-1]
+        self.assertEqual(call["cwd"], str(self.repo))
+        sh("git", "stash", "-u", "-q", cwd=self.repo)
+        sh("git", "switch", "-q", "master", cwd=self.repo)
+        res = self.handoff("review", str(bundle), "-a", "codex", expect=1)
+        self.assertIn("uncommitted work", res.stderr)
 
     def test_review_uses_temporary_worktree_when_checkout_moved(self):
         bundle = self.init()
