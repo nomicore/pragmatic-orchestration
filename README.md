@@ -27,7 +27,8 @@ Full documentation: [skills/pragmatic-orchestration/README.md](skills/pragmatic-
 
 **`peer-handoff`** lets the agent that did the work hand its task to its peers and orchestrate the outcome. `handoff init` packs the task (a Linear issue, a file or text), the project context and what was done into a bundle outside the repository. Then either:
 
-- `handoff review` — peers review the work against the task, read-only, through `porch review`; or
+- `handoff review` — peers review the work against the task, read-only, through `porch review`;
+- `handoff init --proposal PATH` + `handoff review` — peers check an implementation proposal against the code before anything is built, read-only; or
 - `handoff compete` — peers implement the same task independently, each in its own git worktree, through `porch delegate`; `handoff collect` gathers the patches, runs the acceptance checks in every worktree and writes a side-by-side comparison; `handoff adopt` brings the better parts into the original checkout.
 
 The orchestrator judges, merges and owns the single result. See [skills/peer-handoff/SKILL.md](skills/peer-handoff/SKILL.md) and [skills/peer-handoff/README.md](skills/peer-handoff/README.md).

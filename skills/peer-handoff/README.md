@@ -5,7 +5,9 @@ Let one coding agent hand its task to its peers and orchestrate the result.
 The agent that did the work (for example Claude Code) packs the task, the
 project context and what it did into a **handoff bundle**. Peers then either:
 
-- **review** that work against the task, read-only, through `porch review`; or
+- **review** that work against the task, read-only, through `porch review`;
+- **check a proposal** against the code before anything is built, read-only,
+  through `porch review` (`handoff init --proposal PATH`); or
 - **compete**: implement the same task independently, each in its own git
   worktree, through `porch delegate`.
 

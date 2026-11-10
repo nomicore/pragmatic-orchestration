@@ -1,6 +1,6 @@
 ---
 name: peer-handoff
-description: "Hand the current task to peer coding agents (Codex, OpenCode, Antigravity, Claude Code, Grok, Devin through porch) and orchestrate the result: a task-aware peer review of the work you did, or independent implementations of the same task in separate git worktrees that are collected, tested and compared so you can cherry-pick the best parts. Use when the user asks to get a second opinion from other agents, 'ask your buddies', have peers review a branch or PR, run a bake-off between agents, or compare independent implementations. Builds the handoff brief (task from Linear or a file, project context, what you did) so the user does not have to."
+description: "Hand the current task to peer coding agents (Codex, OpenCode, Antigravity, Claude Code, Grok, Devin through porch) and orchestrate the result: a task-aware peer review of the work you did, a check of an implementation proposal against the code before anything is built, or independent implementations of the same task in separate git worktrees that are collected, tested and compared so you can cherry-pick the best parts. Use when the user asks to get a second opinion from other agents, 'ask your buddies', have peers review a branch, PR, implementation proposal or plan, run a bake-off between agents, or compare independent implementations. Builds the handoff brief (task from Linear or a file, project context, what you did) so the user does not have to."
 ---
 
 # Peer handoff
