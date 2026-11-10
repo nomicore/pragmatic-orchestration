@@ -124,6 +124,21 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(len(manifest["reviews"]), 2)
         self.assertTrue(all(Path(r["file"]).is_file() for r in manifest["reviews"]))
 
+    def test_review_refuses_unknown_or_unavailable_peers(self):
+        bundle = self.init()
+        res = self.handoff("review", str(bundle), "-a", "codex,no-such-peer", "--dry-run", expect=1)
+        self.assertIn("unknown porch agent id(s): no-such-peer", res.stderr)
+        res = self.handoff("review", str(bundle), "-a", "codex,grok", expect=1)
+        self.assertIn("not installed", res.stderr)
+        self.assertEqual(json.loads((bundle / "manifest.json").read_text())["reviews"], [])
+
+    def test_review_dry_run_lists_resolved_peers(self):
+        bundle = self.init()
+        out = self.handoff("review", str(bundle), "--dry-run", "-a", "codex,antigravity").stdout
+        self.assertIn("# peers: codex, antigravity", out)
+        # Without -a: porch's enabled pool, minus agents whose CLI is missing.
+        self.assertIn("# peers: codex\n", self.handoff("review", str(bundle), "--dry-run").stdout)
+
     def test_review_records_usage_and_cost_per_peer(self):
         bundle = self.init()
         res = self.handoff("review", str(bundle), "-a", "codex,oc-kimi-k3.1")

@@ -29,6 +29,7 @@ if argv[:1] == ["--list-agents"]:
     print('  <agent id="codex" label="Codex" backend="codex-cli" model="m" role="analyst" enabled="true" backend-available="true"/>')
     print('  <agent id="antigravity" label="AGY" backend="antigravity" model="m" role="lateral" enabled="false" backend-available="true"/>')
     print('  <agent id="oc-kimi-k3.1" label="Kimi" backend="opencode" model="openrouter/moonshotai/kimi-k3.1-pro" role="lateral" enabled="false" backend-available="true"/>')
+    print('  <agent id="grok" label="Grok" backend="grok-build" model="m" role="analyst" enabled="true" backend-available="false"/>')
     print("</porch-plan>")
     sys.exit(0)
 

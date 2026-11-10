@@ -52,7 +52,7 @@ answers by hand.
 |---|---|
 | `handoff init` | Build a bundle from the task (`--task-linear`, `--task-file`, `--task-text`), context (`--context-file`, `--context-note`), notes and acceptance checks; `--include-uncommitted` hands over the working tree as it is |
 | `handoff init --proposal PATH` | Bundle for a proposal instead of a diff: snapshots one file or a folder; `--repo` and `--head` choose the code it is checked against |
-| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default), porch diff review (`--kind code --depth …`), or a check of a proposal against the code (`--kind proposal`, default for proposal bundles); records each peer's tokens and cost |
+| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default), porch diff review (`--kind code --depth …`), or a check of a proposal against the code (`--kind proposal`, default for proposal bundles); refuses an `-a` id porch does not know or whose CLI is missing (porch itself would skip it without a warning); `--dry-run` prints the resolved peers and the command; records each peer's tokens and cost |
 | `handoff cost BUNDLE` | Tokens, time and cost per peer across the bundle's reviews (`--json`) |
 | `handoff report BUNDLE` | Round record: change size and components, task size, ambiguity, cost per peer; `--ledger` appends a summary row |
 | `handoff compete BUNDLE -a a,b,c` | One worktree + branch per agent at the base commit; launch each peer on the implement brief |

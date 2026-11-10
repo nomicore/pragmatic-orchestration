@@ -158,8 +158,32 @@ def agent_info() -> Dict[str, Dict[str, str]]:
         attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
         if "id" in attrs:
             info[attrs["id"]] = {"backend": attrs.get("backend", ""), "model": attrs.get("model", ""),
-                                 "enabled": attrs.get("enabled", "")}
+                                 "enabled": attrs.get("enabled", ""),
+                                 "available": attrs.get("backend-available", "")}
     return info
+
+
+def review_peers(spec: Optional[str]) -> List[str]:
+    """The peers a review will call; refuses ids porch would skip.
+
+    `porch review` drops an `-a` id it does not know without a warning as long
+    as another id matches, so a typo or a missing profile would quietly shrink
+    the round. Without `-a` porch uses its enabled pool.
+    """
+    info = agent_info()
+    if not info:
+        raise HandoffError("`porch --list-agents` listed no agents; check porch and its config.json")
+    if not spec:
+        return [a for a, v in info.items() if v["enabled"] == "true" and v["available"] != "false"]
+    agents = parse_agents(spec)
+    unknown = [a for a in agents if a not in info]
+    if unknown:
+        raise HandoffError("unknown porch agent id(s): " + ", ".join(unknown)
+                           + ". porch would skip them without a warning; `porch --list-agents` shows the ids")
+    missing = [a for a in agents if info[a]["available"] == "false"]
+    if missing:
+        raise HandoffError("agent CLI not installed or not on PATH for: " + ", ".join(missing))
+    return agents
 
 
 def agent_backends() -> Dict[str, str]:
@@ -602,6 +626,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     if needs_worktree:
         # One worktree per run: a concurrent review must not lose its directory to this one's cleanup.
         review_root = review_wt = bundle / "worktrees" / f"review-{head[:12]}-{stamp}-{os.getpid()}"
+    peers = review_peers(args.agents)
     porch = porch_bin()
     agents = ["-a", args.agents] if args.agents else []
     if kind in ("ask", "proposal"):
@@ -612,6 +637,9 @@ def cmd_review(args: argparse.Namespace) -> int:
         argv = [porch, "review", "code", "--diff", "--depth", args.depth, "--progress", args.progress, *agents]
         stdin = (bundle / "ours.patch").read_text(encoding="utf-8")
     if args.dry_run:
+        print("# peers: " + (", ".join(peers) or "none enabled"))
+        if review_wt is not None:
+            print("# the worktree below is created only by a real run")
         print(f"cd {shlex.quote(str(review_root))} && {shlex.join(argv)}" + (" < ours.patch" if stdin else ""))
         return 0
     if review_wt is not None:
