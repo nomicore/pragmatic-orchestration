@@ -25,6 +25,7 @@ the catalogue. Standard library only.
 from __future__ import annotations
 
 import json
+import re
 import os
 import time
 import urllib.error
@@ -36,6 +37,7 @@ CATALOGUE_URL = os.environ.get("PEER_HANDOFF_PRICES_URL", "https://openrouter.ai
 CATALOGUE_MAX_AGE = 24 * 3600
 DEFAULT_BILLING = {"codex-cli": "subscription", "claude-code": "subscription"}
 # Effort suffixes some CLIs put in the model name; list prices do not depend on them.
+OPENCODE_OWN_PROVIDERS = ("opencode-go", "opencode")
 EFFORT_SUFFIXES = ("-xhigh", "-high", "-medium", "-low", "-minimal")
 BACKEND_VENDOR = {"codex-cli": "openai", "antigravity": "google", "gemini-cli": "google",
                   "claude-code": "anthropic", "grok-build": "x-ai"}
@@ -93,6 +95,7 @@ def extract_usage(raw: Path, backend: str) -> Dict[str, Any]:
             u["output"] += int(t.get("output") or 0) + int(t.get("reasoning") or 0)
             u["reasoning"] += int(t.get("reasoning") or 0)
             u["cached"] += int((t.get("cache") or {}).get("read") or 0)
+            u["input"] += int((t.get("cache") or {}).get("write") or 0)
             u["calls"] += 1
             if part.get("cost") is not None:
                 cost += float(part["cost"])
@@ -192,7 +195,22 @@ def _strip_effort(model: str) -> str:
     return model
 
 
-def catalogue_id(backend: str, model: str, pricing: Dict[str, Any]) -> Optional[str]:
+def _match_by_name(name: str, catalogue: Optional[Dict[str, Dict[str, float]]]) -> Optional[str]:
+    """OpenRouter id whose model part is `name`, or `name` plus a date suffix
+    (`qwen3.8-max` -> `qwen/qwen3.8-max-0902`). Used for OpenCode's own
+    providers (Go, Zen), whose ids carry no vendor."""
+    if not catalogue:
+        return None
+    exact = [cid for cid in catalogue if cid.split("/", 1)[-1] == name]
+    if exact:
+        return sorted(exact, key=len)[0]
+    dated = [cid for cid in catalogue
+             if re.fullmatch(re.escape(name) + r"-\d{4}", cid.split("/", 1)[-1])]
+    return sorted(dated)[-1] if dated else None
+
+
+def catalogue_id(backend: str, model: str, pricing: Dict[str, Any],
+                 catalogue: Optional[Dict[str, Dict[str, float]]] = None) -> Optional[str]:
     """Best guess of the OpenRouter id for a porch agent's model."""
     mapped = (pricing.get("models") or {}).get(model)
     if mapped:
@@ -201,6 +219,8 @@ def catalogue_id(backend: str, model: str, pricing: Dict[str, Any]) -> Optional[
         provider, _, rest = model.partition("/")
         if provider == "openrouter":
             return rest
+        if provider in OPENCODE_OWN_PROVIDERS:
+            return _match_by_name(rest, catalogue)
         return model if rest else None
     vendor = BACKEND_VENDOR.get(backend)
     if not vendor:
@@ -213,7 +233,7 @@ def price_for(backend: str, model: str, pricing: Dict[str, Any],
     explicit = (pricing.get("prices") or {}).get(model)
     if explicit:
         return explicit, "pricing.json"
-    cid = catalogue_id(backend, model, pricing)
+    cid = catalogue_id(backend, model, pricing, catalogue)
     if cid and cid in catalogue:
         return catalogue[cid], f"openrouter:{cid}"
     return None, "unpriced"
@@ -234,7 +254,12 @@ def cost_row(agent_id: str, backend: str, model: str, raw: Path,
              started: Optional[float] = None) -> Dict[str, Any]:
     u = extract_usage(raw, backend) if raw.is_file() else empty_usage()
     price, source = price_for(backend, model, pricing, catalogue)
-    if u["reported_cost"] is not None:
+    billing = billing_mode(agent_id, backend, model, pricing)
+    # A plan-covered OpenCode Go model reports cost 0; show its list-price
+    # weight instead, like Codex, so plan peers stay comparable.
+    plan_zero = (billing == "subscription" and u["reported_cost"] == 0
+                 and (u["input"] or u["cached"] or u["output"]))
+    if u["reported_cost"] is not None and not plan_zero:
         cost, source = u["reported_cost"], "reported by backend"
     elif price:
         cost = round((u["input"] * price["input"] + u["cached"] * price["cached"]

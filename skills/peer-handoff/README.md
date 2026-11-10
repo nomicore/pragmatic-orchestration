@@ -55,6 +55,8 @@ answers by hand.
 | `handoff review BUNDLE` | Task-aware review (`--kind ask`, default), porch diff review (`--kind code --depth …`), or a check of a proposal against the code (`--kind proposal`, default for proposal bundles); refuses an `-a` id porch does not know or whose CLI is missing (porch itself would skip it without a warning); `--dry-run` prints the resolved peers and the command; records each peer's tokens and cost |
 | `handoff cost BUNDLE` | Tokens, time and cost per peer across the bundle's reviews (`--json`) |
 | `handoff report BUNDLE` | Round record: change size and components, task size, ambiguity, cost per peer; `--ledger` appends a summary row |
+| `handoff findings RECORD` | Checks the findings the orchestrator listed in a round record (severity, category, verdict, outcome, who raised and reproduced each) and writes the per-peer score into the record |
+| `handoff scoreboard PATH…` | Value per model across round records: rounds, failed runs, spent, plan equivalent, real, unique, false and security findings, adopted, discarded, score, dollars per point (`--json`, `--out`) |
 | `handoff compete BUNDLE -a a,b,c` | One worktree + branch per agent at the base commit; launch each peer on the implement brief |
 | `handoff status BUNDLE` | State of every competing worker |
 | `handoff collect BUNDLE` | Patches (committed, uncommitted and untracked), final answers, check results; writes `comparison.md` |

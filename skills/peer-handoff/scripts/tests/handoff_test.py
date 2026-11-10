@@ -193,6 +193,88 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual((u["input"], u["cached"], u["output"], u["calls"]), (150, 3000, 35, 2))
         self.assertIsNone(u["reported_cost"])
 
+    def test_opencode_go_reported_zero_is_priced_at_list_price(self):
+        raw = self.tmp / "go.jsonl"
+        raw.write_text(json.dumps({"type": "step_finish", "part": {"cost": 0, "tokens": {
+            "input": 1_000_000, "output": 100_000, "reasoning": 0, "cache": {"read": 0, "write": 0}}}}) + "\n")
+        catalogue = {"qwen/qwen3.8-max-0902": {"input": 1.0, "cached": 0.1, "output": 5.0},
+                     "qwen/qwen3.8-max-prime": {"input": 9.0, "cached": 0.9, "output": 9.0}}
+        row = handoff.usage.cost_row("go-qwen", "opencode", "opencode-go/qwen3.8-max", raw, {}, catalogue)
+        self.assertEqual(row["billing"], "subscription")
+        self.assertEqual(row["price_source"], "openrouter:qwen/qwen3.8-max-0902")
+        self.assertAlmostEqual(row["cost_usd"], 1.5, places=6)
+
+    def test_metered_reported_zero_stays_zero(self):
+        raw = self.tmp / "free.jsonl"
+        raw.write_text(json.dumps({"type": "step_finish", "part": {"cost": 0, "tokens": {"input": 10, "output": 1}}}) + "\n")
+        row = handoff.usage.cost_row("free", "opencode", "openrouter/x/y", raw, {}, {"x/y": {"input": 1, "cached": 1, "output": 1}})
+        self.assertEqual((row["cost_usd"], row["price_source"]), (0, "reported by backend"))
+
+    def scored_record(self):
+        runs = [{"id": p, "agent": p, "model": m, "billing": b, "cost_usd": c, "duration_s": 600, "status": st}
+                for p, m, b, c, st in (("codex", "gpt-6.1-sol", "subscription", 0.6, "report"),
+                                       ("argon", "opencode-go/gemini-4-argon", "subscription", 2.0, "report"),
+                                       ("kimi", "openrouter/moonshotai/kimi-k3.1-pro", "metered", 1.0, "report"),
+                                       ("agy", "gemini-4-argon-high", "metered", 5.0, "failed"))]
+        f = [
+            {"id": 1, "title": "everyone", "raised_by": "all", "severity": "critical", "category": "security",
+             "verdict": "true", "outcome": "fixed"},
+            {"id": 2, "title": "codex only", "raised_by": ["codex"], "reproduced_by": ["codex"], "severity": "major",
+             "category": "correctness", "verdict": "true", "outcome": "fixed"},
+            {"id": 3, "title": "gold plating", "raised_by": ["kimi"], "severity": "major", "category": "design",
+             "verdict": "true", "outcome": "out-of-scope"},
+            {"id": 4, "title": "invented", "raised_by": ["argon"], "severity": "major", "category": "correctness",
+             "verdict": "false", "outcome": "rejected"},
+        ]
+        return {"date": "2026-11-10", "peer_runs": runs, "findings": f}
+
+    def test_scores_split_shared_findings_and_penalise_discards_and_false_claims(self):
+        rec = self.scored_record()
+        self.assertEqual(handoff.findings.validate(rec), [])
+        s = handoff.findings.round_scores(rec)
+        # #1: critical 8 split over 3 working peers; the failed run gets nothing.
+        self.assertAlmostEqual(s["codex"]["score"], 8 / 3 + 4 * 1.25)
+        self.assertAlmostEqual(s["kimi"]["score"], 8 / 3 + 4 * 0.25)
+        self.assertAlmostEqual(s["argon"]["score"], 8 / 3 - 2)
+        self.assertEqual((s["agy"]["score"], s["agy"]["failed"], s["agy"]["spent_usd"]), (0, 1, 5.0))
+        self.assertEqual((s["codex"]["unique"], s["codex"]["security"], s["kimi"]["discarded"], s["argon"]["false"]),
+                         (1, 1, 1, 1))
+        board = handoff.findings.scoreboard([(Path("r.md"), "", rec)])
+        self.assertEqual(board["gemini-4-argon"]["routes"], {"argon", "agy"})
+        self.assertEqual(board["gemini-4-argon"]["rounds"], 2)
+        self.assertEqual(board["kimi-k3.1-pro"]["spent_usd"], 1.0)
+
+    def test_validate_reports_unknown_peer_and_bad_values(self):
+        rec = self.scored_record()
+        rec["findings"].append({"id": 5, "title": "x", "raised_by": ["nobody"], "severity": "huge",
+                                "category": "security", "verdict": "true", "outcome": "fixed"})
+        problems = handoff.findings.validate(rec)
+        self.assertTrue(any("'nobody'" in p for p in problems))
+        self.assertTrue(any("severity 'huge'" in p for p in problems))
+
+    def test_report_findings_and_scoreboard_commands(self):
+        bundle = self.init()
+        self.handoff("review", str(bundle), "-a", "codex,oc-kimi-k3.1")
+        rec = self.tmp / "rounds" / "r1.md"
+        self.handoff("report", str(bundle), "--out", str(rec))
+        text = rec.read_text()
+        self.assertIn("## Stitching", text)
+        record = json.loads(text.split("<!-- round-record", 1)[1].split("-->", 1)[0])
+        self.assertIsNone(record["findings"])
+        self.assertEqual([r["id"] for r in record["peer_runs"]], ["codex", "oc-kimi-k3.1"])
+        self.assertIn("not filled in", self.handoff("findings", str(rec), expect=2).stderr)
+        record["findings"] = [{"id": 1, "title": "t", "raised_by": ["codex"], "severity": "minor",
+                               "category": "tests", "verdict": "true", "outcome": "fixed"}]
+        handoff.findings.write_record(rec, text, record)
+        out = self.handoff("findings", str(rec)).stdout
+        self.assertIn("| codex |", out)
+        self.assertIn("## Peer score", rec.read_text())
+        self.handoff("findings", str(rec))  # idempotent
+        self.assertEqual(rec.read_text().count("## Peer score"), 1)
+        board = self.handoff("scoreboard", str(self.tmp / "rounds")).stdout
+        self.assertIn("Rounds with findings recorded: 1 of 1", board)
+        self.assertIn("| m |", board)
+
     def test_init_include_uncommitted_hands_over_the_working_tree(self):
         (self.repo / "app.py").write_text("print('hello, uncommitted')\n")
         (self.repo / "new_module.py").write_text("X = 1\n")

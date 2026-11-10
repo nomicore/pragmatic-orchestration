@@ -113,6 +113,8 @@ porch keeps each peer's raw stream; `review` reads the tokens from it and
 prices them:
 
 - OpenCode and Claude Code report a cost themselves; that number is used.
+  OpenCode Go reports 0 for plan-covered models; those are priced at list price
+  like Codex, so the plan figure shows how heavy each peer is.
 - Codex, Antigravity and others report tokens only; they are priced with
   OpenRouter's public list prices (input, cached input, output; cached for a
   day under `$PEER_HANDOFF_HOME/cache/`).
@@ -132,10 +134,59 @@ prices them:
 `report` writes a round record: size of the change (changed lines, size class
 XS–XL, files, components, test files), the task (words, acceptance criteria),
 the ambiguity you rate from 1 (precise) to 5 (exploratory), each peer's
-tokens, time and cost, totals, and cost per 100 changed lines. It leaves a
-findings table and a "peer value" section for you to fill in after verifying,
-and appends a summary row to the ledger. Keep records in the project that owns
-the work; they name its code and findings.
+tokens, time and cost, totals, and cost per 100 changed lines. Its JSON block
+lists each peer run (`peer_runs`, with `status` `report` or `failed` from
+whether the peer left an answer) and leaves `findings` as `null` for you. It
+appends a summary row to the ledger. Keep records in the project that owns the
+work; they name its code and findings.
+
+## 2d. Record the findings (every round, after stitching)
+
+The round is not finished until the record says what each peer was worth.
+Once you have verified the claims and acted on them, fill the record in:
+
+1. **`findings` in the JSON block:** one entry per claim any peer made,
+   including the ones you rejected. Merge duplicates into one entry and list
+   everyone who raised it.
+
+   | Field | Values |
+   |---|---|
+   | `id`, `title` | number, one line |
+   | `raised_by` | list of `peer_runs` ids, or `"all"` (every peer that reported) |
+   | `reproduced_by` | peers that proved it (test, script, trace), subset of `raised_by` |
+   | `severity` | `critical`, `major`, `minor`, `nit`: your rating, not the peer's |
+   | `category` | `security`, `correctness`, `reliability`, `performance`, `ops`, `tests`, `docs`, `design` |
+   | `verdict` | `true`, `partly`, `false` (the claim does not hold, or its evidence was invented), `unverified` |
+   | `outcome` | `fixed`, `accepted` (kept as is, with reason), `deferred` (real, later ticket), `open`, `out-of-scope` (beyond the ticket or proposal, over-engineered), `not-a-defect`, `rejected` |
+   | `note` | why you used or discarded it |
+
+   Correct a peer's `status` in `peer_runs` if needed (`partial` when it
+   answered only part of the brief).
+2. **`## Findings`:** the same list as a table for people.
+3. **`## Stitching`:** what you used, what you discarded and why, what only
+   one peer saw, and what to change in the brief or the peer pool.
+4. **Check and score:** `"$HANDOFF" findings <record>` validates the list
+   and writes a `## Peer score` table into the record.
+5. **Later:** when a deferred or open finding gets done or dropped, update
+   its `outcome` and run `findings` again.
+
+Scoring: severity weight (critical 8, major 4, minor 2, nit 1) × verdict
+(true 1, partly 0.5) × outcome (fixed or accepted 1, deferred or open 0.6,
+out of scope 0.25, not a defect or rejected 0), split among the peers that
+raised it, ×1.25 for a peer that reproduced it. A false claim costs each peer
+that made it half its severity weight. What every peer finds is worth little
+to any one of them; what one peer finds and we act on is worth the most; what
+we never act on is worth little however clever it is.
+
+```bash
+"$HANDOFF" scoreboard <project>/peer-reviews [<other project>/peer-reviews …] --out scoreboard.md
+```
+
+`scoreboard` adds this up per model across rounds (a model keeps one row when
+its route changes, e.g. Antigravity to OpenCode Go): rounds, failed runs,
+money spent, plan equivalent, findings raised, real, unique, false, security,
+adopted, discarded, score, score per round and list-price dollars per point.
+Rounds whose `findings` is still `null` are counted but not scored.
 
 ## 2b. Independent implementations
 

@@ -16,9 +16,13 @@ Bundles live outside the repository, under $PEER_HANDOFF_HOME
 
 Every review records each peer's tokens and cost (see usage.py); `cost`
 sums them per bundle and `report` writes a round record with metrics of the
-change, the peers that took part and what each one cost.
+change, the peers that took part and what each one cost. After stitching the
+reviews, the orchestrator lists every finding in the record; `findings` checks
+that list and scores each peer, and `scoreboard` adds up value, cost and
+failures per model across all round records (see findings.py).
 
-Commands: init, review, cost, report, compete, status, collect, adopt, cleanup, list.
+Commands: init, review, cost, report, findings, scoreboard, compete, status,
+collect, adopt, cleanup, list.
 Run `handoff <command> --help` for options. Standard library only.
 """
 from __future__ import annotations
@@ -41,6 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import usage  # noqa: E402  (sibling module, standard library only)
+import findings  # noqa: E402
 
 SKILL_DIR = SCRIPT_DIR.parent
 PROMPTS_DIR = SKILL_DIR / "prompts"
@@ -779,6 +784,69 @@ AMBIGUITY_SCALE = {
 }
 
 
+def peer_status(manifest: Dict[str, Any], agent: str, only: Optional[Sequence[str]] = None) -> str:
+    """`report` if the peer left a non-empty final answer in any included review, else `failed`."""
+    for rec in manifest.get("reviews", []):
+        if only and not any(Path(rec.get("file", "")).name.startswith(o) for o in only):
+            continue
+        run_dir = rec.get("run_dir")
+        if not run_dir:
+            return "report"  # older reviews kept no run directory; let the orchestrator correct it
+        for f in (Path(run_dir) / "final").glob(f"{agent}*.txt"):
+            try:
+                if f.read_text(encoding="utf-8", errors="replace").strip():
+                    return "report"
+            except OSError:
+                pass
+    return "failed"
+
+
+def cmd_findings(args: argparse.Namespace) -> int:
+    path = Path(args.record).expanduser()
+    text, record = findings.read_record(path)
+    if not isinstance(record.get("findings"), list):
+        print(f"{path}: `findings` is not filled in yet (null); add the list to the JSON block", file=sys.stderr)
+        return 2
+    if "peer_runs" not in record:
+        record["peer_runs"] = findings.peer_runs(record, text)
+    problems = findings.validate(record, text)
+    for p in problems:
+        print(f"{path}: {p}", file=sys.stderr)
+    if problems:
+        return 1
+    scores = findings.round_scores(record, text)
+    text = findings.write_record(path, text, record)
+    path.write_text(findings.put_round_score(text, scores), encoding="utf-8")
+    print(findings.round_md(scores))
+    return 0
+
+
+def cmd_scoreboard(args: argparse.Namespace) -> int:
+    records = findings.collect(Path(p) for p in args.paths)
+    if not records:
+        print("no round records found", file=sys.stderr)
+        return 1
+    bad = 0
+    for path, text, rec in records:
+        if isinstance(rec.get("findings"), list):
+            for p in findings.validate(rec, text):
+                print(f"{path}: {p}", file=sys.stderr)
+                bad += 1
+    board = findings.scoreboard(records)
+    scored = sum(1 for _p, _t, r in records if isinstance(r.get("findings"), list))
+    if args.json:
+        out = {k: {**v, "routes": sorted(v["routes"])} for k, v in board.items()}
+        text = json.dumps({"rounds": len(records), "scored": scored, "peers": out}, indent=2) + "\n"
+    else:
+        text = "# Peer scoreboard\n\n" + findings.board_md(board, scored, len(records)) + "\n"
+    if args.out:
+        write(Path(args.out).expanduser(), text)
+        print(args.out)
+    else:
+        sys.stdout.write(text)
+    return 1 if bad else 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     bundle = resolve_bundle(args.bundle)
     manifest = load_manifest(bundle)
@@ -805,6 +873,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         "uncommitted": bool(manifest.get("uncommitted")), "pr": args.pr, "ticket": args.ticket,
         "ambiguity": amb, "metrics": m, "peers": [r["agent"] for r in rows], "cost": summary,
         "cost_per_100_changed_lines_usd": round(per100, 4) if per100 is not None else None,
+        "peer_runs": [{"id": r["agent"], "agent": r["agent"], "model": r["model"], "billing": r["billing"],
+                       "cost_usd": r["cost_usd"], "duration_s": r.get("duration_s"),
+                       "status": peer_status(manifest, r["agent"], args.review)} for r in rows],
+        "findings": None,
     }
     lines = [f"# Peer review round: {title}", "",
              f"- **Date:** {record['date']}"]
@@ -828,8 +900,15 @@ def cmd_report(args: argparse.Namespace) -> int:
               "", "## Peers and cost", "", usage.table_md(rows) if rows else "_No recorded usage._", ""]
     if per100 is not None:
         lines += [f"List-price cost per 100 {size_unit}: {usage.fmt_usd(per100)}.", ""]
-    lines += ["## Findings", "", "_Orchestrator: one row per finding: who raised it, verified or not, verdict._", "",
-              "| # | Finding | Raised by | Verified | Verdict |", "|---|---|---|---|---|", "",
+    lines += ["## Findings", "",
+              "_Orchestrator: one row per claim any peer made, including the ones you rejected. Fill the "
+              "`findings` list in the JSON block below (fields in the skill's \"Record the findings\" step), "
+              "then run `handoff findings` on this file to check it and generate the peer score._", "",
+              "| # | Finding | Raised by | Severity | Category | Verdict | Outcome |", "|---|---|---|---|---|---|---|", "",
+              "## Stitching", "",
+              "_Orchestrator, after acting on the reviews: what you used, what you discarded and why (out of "
+              "scope, over-engineered, not a defect, false), what only one peer saw, and what to change in the "
+              "brief or the peer pool next time._", "",
               "## Peer value", "", "_Orchestrator: which peers found something real, which added noise._", "",
               "<!-- round-record", json.dumps(record, indent=2), "-->", ""]
     text = "\n".join(lines)
@@ -1265,6 +1344,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ambiguity", type=int, choices=range(1, 6), metavar="1-5",
                    help="how open the task is: 1 precise … 5 exploratory")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("findings", help="check a round record's findings and write its per-peer score")
+    p.add_argument("record", help="round record written by `report`, with `findings` filled in")
+    p.set_defaults(func=cmd_findings)
+
+    p = sub.add_parser("scoreboard", help="per-model value across round records: findings, cost, failures")
+    p.add_argument("paths", nargs="+", help="round record files or directories (searched recursively)")
+    p.add_argument("--out", help="write here (default: stdout)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_scoreboard)
 
     p = sub.add_parser("compete", help="independent implementations, one git worktree per agent")
     p.add_argument("bundle")
