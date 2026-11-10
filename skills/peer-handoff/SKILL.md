@@ -54,8 +54,8 @@ BUNDLE=$("$HANDOFF" init \
 - Bundles live under `$PEER_HANDOFF_HOME` (default `~/.peer-handoff`), outside
   the repository. They can contain task and project details: never commit them.
 
-The bundle holds `task.md`, `context.md`, `work.md`, `ours.patch`, the two
-generated briefs and `manifest.json`. Read `brief-review.md` once before
+The bundle holds `task.md`, `context.md`, `work.md`, `ours.patch`, the
+generated briefs (a proposal bundle: see 2d) and `manifest.json`. Read `brief-review.md` once before
 launching anything: it is exactly what peers receive.
 
 ## 2a. Peer review of your work
@@ -78,6 +78,34 @@ launching anything: it is exactly what peers receive.
 - Every review also records what each peer cost, in
   `$BUNDLE/reviews/<stamp>-<kind>.usage.json`, and prints the table. See
   section 2c.
+
+## 2d. Peer review of a proposal, before anything is built
+
+```bash
+BUNDLE=$("$HANDOFF" init \
+  --repo /path/to/the/code \
+  --proposal path/to/proposal-folder-or-file \
+  --head origin/main \
+  --task-linear ENG-123 \
+  --notes "What I am unsure of")
+"$HANDOFF" review "$BUNDLE" -a codex,antigravity
+```
+
+- `--proposal` takes one file or a folder, which can live outside the
+  repository. It is copied into the bundle, so a round reviews one fixed
+  version. Hidden files and symlinks are left out. Text files are inlined in
+  the brief up to 200 KB in total; anything else is listed for peers to open.
+- `--repo` and `--head` choose the code the proposal is checked against. Use
+  the branch the work will build on. Every review runs in its own fresh
+  worktree at that commit, so local edits never reach peers, and
+  `--allow-head-mismatch` is refused.
+- `--kind proposal` is the default for these bundles. Peers get
+  `brief-proposal.md`, which asks for a go / go with changes / rethink verdict
+  and evidence for each finding.
+- `--base`, `--include-uncommitted` and `--check` do not apply, and `compete`,
+  `collect` and `adopt` refuse a proposal bundle. A task is optional.
+- `report` measures the round by the size of the proposal. Judge the findings
+  by evidence, exactly as for a code review.
 
 ## 2c. Cost of a round
 

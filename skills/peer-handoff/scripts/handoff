@@ -5,7 +5,9 @@ independent implementation, then collect and compare what they produced.
 The orchestrating agent (the one that did the work) builds a handoff bundle:
 the task, the project context, and what it did. Peers then either review that
 work (read-only, through `porch review`) or implement the same task
-independently in their own git worktrees (through `porch delegate`). `collect`
+independently in their own git worktrees (through `porch delegate`). A bundle
+can instead hold a proposal (`init --proposal`), which peers check against the
+code before anything is built (`review --kind proposal`). `collect`
 gathers every implementation, runs the acceptance checks, and writes a
 comparison the orchestrator uses to pick the best parts.
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import re
@@ -45,6 +48,7 @@ SIBLING_PORCH = SKILL_DIR.parent / "pragmatic-orchestration" / "scripts" / "porc
 
 LINEAR_URL = os.environ.get("PEER_HANDOFF_LINEAR_URL", "https://api.linear.app/graphql")
 INLINE_CONTEXT_LIMIT = 20_000  # bytes per context file inlined into briefs
+PROPOSAL_INLINE_LIMIT = 200_000  # bytes of proposal text inlined into the brief, all files together
 CHECK_TIMEOUT = int(os.environ.get("PEER_HANDOFF_CHECK_TIMEOUT", "1800"))
 OURS = "ours"
 
@@ -283,14 +287,98 @@ def task_file_markdown(path: Path) -> str:
     return f"# Task ({path.name})\n\nBinary task document; read it directly: `{path}`\n"
 
 
+# ---------------------------------------------------------------- proposals
+
+def proposal_sources(source: Path) -> List[tuple]:
+    """(file, path inside the proposal) pairs. Hidden entries and symlinks stay out."""
+    if not source.exists():
+        raise HandoffError(f"proposal not found: {source}")
+    if source.is_file():
+        return [(source, Path(source.name))]
+    if not source.is_dir():
+        raise HandoffError(f"proposal is not a file or folder: {source}")
+    pairs = []
+    for root, dirs, names in os.walk(source, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            path = Path(root) / name
+            if not name.startswith(".") and path.is_file() and not path.is_symlink():
+                pairs.append((path, path.relative_to(source)))
+    if not pairs:
+        raise HandoffError(f"proposal folder has no files: {source}")
+    return pairs
+
+
+def as_text(data: bytes) -> Optional[str]:
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def snapshot_proposal(pairs: Sequence[tuple], dest: Path) -> List[Dict[str, Any]]:
+    """Copy the proposal into the bundle, so a round reviews one fixed version."""
+    files = []
+    for src, rel in pairs:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        data = target.read_bytes()
+        text = as_text(data)
+        files.append({"path": rel.as_posix(), "bytes": len(data), "text": text is not None,
+                      "lines": len(text.splitlines()) if text is not None else 0})
+    # Documents first, top level before nested: the inline budget should go to them.
+    files.sort(key=lambda f: (not f["path"].lower().endswith((".md", ".markdown")), "/" in f["path"], f["path"]))
+    return files
+
+
+def proposal_markdown(root: Path, files: Sequence[Dict[str, Any]]) -> str:
+    """Inline the text files; list anything else so peers can open it from disk."""
+    inlined, on_disk = [], []
+    used = 0
+    for f in files:
+        if f["text"] and used + f["bytes"] <= PROPOSAL_INLINE_LIMIT:
+            used += f["bytes"]
+            body = (root / f["path"]).read_text(encoding="utf-8").rstrip().replace("</proposal_file", "&lt;/proposal_file")
+            inlined.append(f'<proposal_file path="{html.escape(f["path"], quote=True)}">\n{body}\n</proposal_file>')
+        else:
+            on_disk.append(f"- `{root / f['path']}` ({max(1, f['bytes'] // 1024)} KiB)")
+    parts = inlined
+    if on_disk:
+        parts = parts + ["Files of the proposal left out of this brief. Read them from disk; if you cannot "
+                         "open one, say so in your report:\n\n" + "\n".join(on_disk)]
+    return "\n\n".join(parts)
+
+
+def require_implementation(manifest: Dict[str, Any], command: str) -> None:
+    if manifest.get("proposal"):
+        raise HandoffError(f"{command} needs implemented work; this bundle holds a proposal. "
+                           "Use `review --kind proposal`")
+
+
 # ---------------------------------------------------------------- init
 
 def cmd_init(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
-    base_ref = args.base or default_base(repo)
-    base_sha = git(repo, "merge-base", base_ref, args.head).strip()
-    head_sha = git(repo, "rev-parse", args.head).strip()
-    branch = git(repo, "rev-parse", "--abbrev-ref", args.head).strip()
+    proposal_pairs: Optional[List[tuple]] = None
+    proposal_source: Optional[Path] = None
+    if args.proposal:
+        for given, flag in ((args.base, "--base"), (args.include_uncommitted, "--include-uncommitted"),
+                            (args.check, "--check")):
+            if given:
+                raise HandoffError(f"{flag} does not apply with --proposal: a proposal has no diff; "
+                                   "--head picks the code it is checked against")
+        proposal_source = Path(args.proposal).expanduser().resolve()
+        proposal_pairs = proposal_sources(proposal_source)
+        head_sha = git(repo, "rev-parse", "--verify", f"{args.head}^{{commit}}").strip()
+        base_ref, base_sha = args.head, head_sha
+    else:
+        base_ref = args.base or default_base(repo)
+        base_sha = git(repo, "merge-base", base_ref, args.head).strip()
+        head_sha = git(repo, "rev-parse", args.head).strip()
+    branch = git(repo, "rev-parse", "--abbrev-ref", args.head).strip() or args.head  # empty for a bare SHA
 
     task_parts: List[str] = []
     task_sources: List[str] = []
@@ -310,7 +398,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         task_sources.append("text")
         title_hint = title_hint or t[:60]
     if not task_parts:
-        raise HandoffError("no task: pass --task-linear, --task-file or --task-text")
+        if proposal_source is None:
+            raise HandoffError("no task: pass --task-linear, --task-file or --task-text")
+        task_parts.append(f"# Proposal: {proposal_source.stem}\n\nNo separate task was given; the proposal states its goal.\n")
+        title_hint = proposal_source.stem
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     bundle_id = f"{stamp}-{slugify(args.slug or title_hint or branch)}"
@@ -337,6 +428,30 @@ def cmd_init(args: argparse.Namespace) -> int:
                           f"Large document ({size // 1024} KiB); read it in full: `{dest}`", ""]
     context_md = "\n".join(ctx_lines).rstrip() + "\n" if ctx_lines else "_No additional project context supplied._\n"
 
+    notes = ""
+    if args.notes_file:
+        notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8")
+    if args.notes:
+        notes = (notes + "\n" + args.notes).strip()
+
+    if proposal_pairs is not None:
+        files = snapshot_proposal(proposal_pairs, bundle / "proposal")
+        manifest = {
+            "version": 1, "id": bundle_id, "created": now_iso(), "repo": str(repo),
+            "base_ref": base_ref, "base_sha": base_sha, "head": args.head, "head_sha": head_sha,
+            "branch": branch, "task_sources": task_sources, "context_sources": ctx_sources,
+            "checks": [], "runs": {}, "reviews": [], "uncommitted": False,
+            "proposal": {"source": str(proposal_source), "files": files},
+        }
+        write(bundle / "task.md", "\n\n".join(task_parts))
+        write(bundle / "context.md", context_md)
+        write(bundle / "work.md", notes.strip() or "_None._")
+        write(bundle / "ours.patch", "")
+        save_manifest(bundle, manifest)
+        write_briefs(bundle, manifest)
+        print(bundle)
+        return 0
+
     # What the orchestrator did.
     log = git(repo, "log", "--reverse", "--format=- %h %s", f"{base_sha}..{head_sha}").strip()
     dirty = git(repo, "status", "--porcelain").strip()
@@ -350,11 +465,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         stat = git(repo, "diff", "--stat", f"{base_sha}..{head_sha}").strip()
         patch = git(repo, "diff", "--binary", f"{base_sha}..{head_sha}")
-    notes = ""
-    if args.notes_file:
-        notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8")
-    if args.notes:
-        notes = (notes + "\n" + args.notes).strip()
     work_md = "\n".join([
         f"- **Repository root:** `{repo}`",
         f"- **Branch:** `{branch}`",
@@ -418,6 +528,18 @@ def relevant_files_block(bundle: Path) -> str:
 
 
 def write_briefs(bundle: Path, manifest: Dict[str, Any]) -> None:
+    if manifest.get("proposal"):
+        root = bundle / "proposal"
+        write(bundle / "brief-proposal.md", render_template("proposal-review-brief.md", {
+            "REPO": manifest["repo"],
+            "HEAD_SHA": manifest["head_sha"],
+            "BRANCH": manifest["branch"],
+            "PROPOSAL": proposal_markdown(root, manifest["proposal"]["files"]),
+            "TASK": (bundle / "task.md").read_text(encoding="utf-8").strip(),
+            "CONTEXT": (bundle / "context.md").read_text(encoding="utf-8").strip(),
+            "WORK": (bundle / "work.md").read_text(encoding="utf-8").strip(),
+        }))
+        return
     common = {
         "TASK": (bundle / "task.md").read_text(encoding="utf-8").strip(),
         "CONTEXT": (bundle / "context.md").read_text(encoding="utf-8").strip(),
@@ -446,33 +568,43 @@ def write_briefs(bundle: Path, manifest: Dict[str, Any]) -> None:
 
 # ---------------------------------------------------------------- review
 
+def point_brief_at_worktree(text: str, repo: Path, worktree: Path) -> str:
+    """Move only the brief's repository-root lines; quoted material keeps its paths."""
+    for prefix in ("Repository root: `", "**Repository root:** `"):
+        text = text.replace(f"{prefix}{repo}`", f"{prefix}{worktree}`")
+    return text
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     bundle = resolve_bundle(args.bundle)
     manifest = load_manifest(bundle)
+    is_proposal = bool(manifest.get("proposal"))
+    kind = args.kind or ("proposal" if is_proposal else "ask")
+    if kind == "proposal" and not is_proposal:
+        raise HandoffError("this bundle holds no proposal; build one with `init --proposal PATH`")
+    if is_proposal and kind != "proposal":
+        raise HandoffError(f"--kind {kind} reviews implemented work; this bundle holds a proposal. Use --kind proposal")
     repo = Path(manifest["repo"])
     head = manifest["head_sha"]
     current = git(repo, "rev-parse", "HEAD").strip()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     review_root = repo
     review_wt: Optional[Path] = None
-    brief = bundle / "brief-review.md"
+    brief = bundle / ("brief-proposal.md" if is_proposal else "brief-review.md")
     if manifest.get("uncommitted") and current != head and not args.allow_head_mismatch:
         raise HandoffError(f"{repo} moved to {current[:12]}; the bundle reviews uncommitted work on "
                            f"{head[:12]}. Check that commit out again, or pass --allow-head-mismatch.")
-    if current != head and not args.allow_head_mismatch:
-        # The user's checkout moved on. Review from a throwaway detached
-        # worktree at the reviewed commit instead of touching their checkout.
-        review_wt = bundle / "worktrees" / f"review-{head[:12]}"
-        if not review_wt.exists():
-            git(repo, "worktree", "add", "--detach", str(review_wt), head)
-        review_root = review_wt
-        brief = bundle / "runs" / f"brief-review-{stamp}.md"
-        write(brief, (bundle / "brief-review.md").read_text(encoding="utf-8").replace(str(repo), str(review_wt)))
-        print(f"[peer-handoff] {repo} is at {current[:12]}; reviewing {head[:12]} in {review_wt}",
-              file=sys.stderr)
+    if is_proposal and args.allow_head_mismatch:
+        raise HandoffError("--allow-head-mismatch does not apply to a proposal: it is always checked at its own commit")
+    # A proposal always gets a clean checkout of its commit: local edits, ignored
+    # files and a checkout that moves mid-review must not reach the peers.
+    needs_worktree = is_proposal or (current != head and not args.allow_head_mismatch)
+    if needs_worktree:
+        # One worktree per run: a concurrent review must not lose its directory to this one's cleanup.
+        review_root = review_wt = bundle / "worktrees" / f"review-{head[:12]}-{stamp}-{os.getpid()}"
     porch = porch_bin()
     agents = ["-a", args.agents] if args.agents else []
-    if args.kind == "ask":
+    if kind in ("ask", "proposal"):
         argv = [porch, "review", "ask", "--progress", args.progress, *agents,
                 "--prompt-file", str(brief)]
         stdin = None
@@ -482,8 +614,16 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"cd {shlex.quote(str(review_root))} && {shlex.join(argv)}" + (" < ours.patch" if stdin else ""))
         return 0
+    if review_wt is not None:
+        git(repo, "worktree", "add", "--detach", str(review_wt), head)
+        original_brief = brief
+        brief = bundle / "runs" / f"{original_brief.stem}-{stamp}-{os.getpid()}.md"
+        write(brief, point_brief_at_worktree(original_brief.read_text(encoding="utf-8"), repo, review_wt))
+        if kind in ("ask", "proposal"):
+            argv[argv.index("--prompt-file") + 1] = str(brief)
+        print(f"[peer-handoff] {repo} is at {current[:12]}; reviewing {head[:12]} in {review_wt}", file=sys.stderr)
     # Keep porch's raw streams with the bundle: they carry each peer's token usage.
-    run_dir = bundle / "runs" / f"{stamp}-{args.kind}"
+    run_dir = bundle / "runs" / f"{stamp}-{kind}"
     env = dict(os.environ, PORCH_RUN_DIR=str(run_dir), PORCH_SAVE_OUTPUTS="1")
     try:
         proc = subprocess.run(argv, cwd=str(review_root), text=True, input=stdin if stdin is not None else "",
@@ -491,15 +631,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     finally:
         if review_wt is not None:
             git(repo, "worktree", "remove", "--force", str(review_wt), check=False)
-    out = bundle / "reviews" / f"{stamp}-{args.kind}.md"
+    out = bundle / "reviews" / f"{stamp}-{kind}.md"
     write(out, proc.stdout)
     rows = review_cost_rows(run_dir)
-    usage_file = bundle / "reviews" / f"{stamp}-{args.kind}.usage.json"
-    write(usage_file, json.dumps({"at": now_iso(), "kind": args.kind, "rows": rows,
+    usage_file = bundle / "reviews" / f"{stamp}-{kind}.usage.json"
+    write(usage_file, json.dumps({"at": now_iso(), "kind": kind, "rows": rows,
                                   "summary": usage.summarize(rows)}, indent=2) + "\n")
     # Re-read: another review of this bundle may have finished while this one ran.
     manifest = load_manifest(bundle)
-    manifest.setdefault("reviews", []).append({"kind": args.kind, "agents": args.agents or "enabled",
+    manifest.setdefault("reviews", []).append({"kind": kind, "agents": args.agents or "enabled",
                                                "file": str(out), "usage": str(usage_file), "run_dir": str(run_dir),
                                                "exit": proc.returncode, "at": now_iso()})
     save_manifest(bundle, manifest)
@@ -586,6 +726,11 @@ def change_metrics(bundle: Path) -> Dict[str, Any]:
     tests = [f for f in files if re.search(r"(^|/)(tests?|spec|__tests__)/|(_test|\.test|\.spec)\.|(^|/)test_", f)]
     components = sorted({"/".join(Path(f).parts[:-1][:3]) or "." for f in files if f not in tests})
     changed = st["added"] + st["removed"]
+    proposal = load_manifest(bundle).get("proposal")
+    if proposal:  # no diff: the size of a proposal round is the document under review
+        files, tests, components = [f["path"] for f in proposal["files"]], [], ["proposal"]
+        st = dict(st, added=sum(f["lines"] for f in proposal["files"]), removed=0)
+        changed = st["added"]
     size = next((label for limit, label in SIZE_CLASSES if changed <= limit), "XL")
     task = (bundle / "task.md").read_text(encoding="utf-8") if (bundle / "task.md").is_file() else ""
     criteria = len(re.findall(r"^\s*[-*]\s*(\[[ xX]\]|☐|☑)", task, flags=re.M))
@@ -623,8 +768,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     review_dates = [r.get("at", "")[:10] for r in manifest.get("reviews", [])
                     if r.get("at") and (not args.review or any(Path(r.get("file", "")).name.startswith(o) for o in args.review))]
     date = args.date or (max(review_dates) if review_dates else dt.date.today().isoformat())
+    is_proposal = bool(manifest.get("proposal"))
+    size_unit = "proposal lines" if is_proposal else "changed lines"
     record = {
-        "date": date, "title": title, "bundle": manifest["id"],
+        "date": date, "title": title, "bundle": manifest["id"], "kind": "proposal" if is_proposal else "code",
         "repo": Path(manifest["repo"]).name, "branch": manifest.get("branch"),
         "base": manifest.get("base_sha", "")[:12], "head": manifest.get("head_sha", "")[:12],
         "uncommitted": bool(manifest.get("uncommitted")), "pr": args.pr, "ticket": args.ticket,
@@ -638,18 +785,21 @@ def cmd_report(args: argparse.Namespace) -> int:
     if args.pr:
         lines.append(f"- **Pull request:** {args.pr}")
     lines += [f"- **Repository / branch:** {record['repo']} / `{record['branch']}`",
-              f"- **Reviewed:** `{record['base']}..{record['head']}`" + (" plus uncommitted changes" if record["uncommitted"] else ""),
+              (f"- **Proposal checked against:** `{record['head']}`" if is_proposal else
+               f"- **Reviewed:** `{record['base']}..{record['head']}`" + (" plus uncommitted changes" if record["uncommitted"] else "")),
               f"- **Bundle:** `{manifest['id']}`", "",
-              "## The change", "",
+              "## The proposal" if is_proposal else "## The change", "",
               "| Metric | Value |", "|---|---|",
-              f"| Size class | **{m['size_class']}** ({m['lines_changed']} changed lines: +{m['lines_added']} / -{m['lines_removed']}) |",
-              f"| Files | {m['files']} ({m['source_files']} source, {m['test_files']} test) |",
+              (f"| Size class | **{m['size_class']}** ({m['lines_changed']} {size_unit}) |" if is_proposal else
+               f"| Size class | **{m['size_class']}** ({m['lines_changed']} {size_unit}: +{m['lines_added']} / -{m['lines_removed']}) |"),
+              (f"| Files | {m['files']} |" if is_proposal else
+               f"| Files | {m['files']} ({m['source_files']} source, {m['test_files']} test) |"),
               f"| Components | {len(m['components'])}: " + ", ".join(f"`{c}`" for c in m["components"]) + " |",
               f"| Task | {m['task_words']} words, {m['acceptance_criteria']} acceptance criteria |",
               f"| Ambiguity | " + (f"{amb}/5 ({AMBIGUITY_SCALE.get(amb, '')})" if amb else "not rated") + " |",
               "", "## Peers and cost", "", usage.table_md(rows) if rows else "_No recorded usage._", ""]
     if per100 is not None:
-        lines += [f"List-price cost per 100 changed lines: {usage.fmt_usd(per100)}.", ""]
+        lines += [f"List-price cost per 100 {size_unit}: {usage.fmt_usd(per100)}.", ""]
     lines += ["## Findings", "", "_Orchestrator: one row per finding: who raised it, verified or not, verdict._", "",
               "| # | Finding | Raised by | Verified | Verdict |", "|---|---|---|---|---|", "",
               "## Peer value", "", "_Orchestrator: which peers found something real, which added noise._", "",
@@ -668,7 +818,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                           "|---|---|---|---|---|---|---|---|\n")
         link = os.path.relpath(Path(args.out).expanduser(), ledger.parent) if args.out else ""
         with ledger.open("a", encoding="utf-8") as fh:
-            fh.write(f"| {record['date']} | {title} | {m['size_class']} ({m['lines_changed']}) | {amb or '-'} | "
+            fh.write(f"| {record['date']} | {title} | {m['size_class']} ({m['lines_changed']}{' proposal' if is_proposal else ''}) | {amb or '-'} | "
                      f"{len(rows)} | {usage.fmt_usd(summary['metered_usd'])} | "
                      f"{usage.fmt_usd(summary['subscription_equiv_usd'])} | "
                      + (f"[record]({link})" if link else "") + " |\n")
@@ -691,6 +841,7 @@ def parse_agents(spec: str) -> List[str]:
 def cmd_compete(args: argparse.Namespace) -> int:
     bundle = resolve_bundle(args.bundle)
     manifest = load_manifest(bundle)
+    require_implementation(manifest, "compete")
     repo = Path(manifest["repo"])
     agents = parse_agents(args.agents)
     backends = agent_backends()
@@ -862,6 +1013,7 @@ def run_checks(path: Path, checks: Sequence[str], log: Path) -> List[Dict[str, A
 def cmd_collect(args: argparse.Namespace) -> int:
     bundle = resolve_bundle(args.bundle)
     manifest = load_manifest(bundle)
+    require_implementation(manifest, "collect")
     repo = Path(manifest["repo"])
     base = manifest["base_sha"]
     checks = [] if args.no_checks else list(manifest.get("checks") or []) + list(args.check or [])
@@ -961,6 +1113,7 @@ def comparison_markdown(manifest: Dict[str, Any], entries: Dict[str, Dict[str, A
 def cmd_adopt(args: argparse.Namespace) -> int:
     bundle = resolve_bundle(args.bundle)
     manifest = load_manifest(bundle)
+    require_implementation(manifest, "adopt")
     repo = Path(manifest["repo"])
     patch = bundle / "results" / f"{args.source}.patch"
     if not patch.is_file():
@@ -1033,7 +1186,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init", help="build a handoff bundle (task + context + work done)")
     p.add_argument("--repo", default=".", help="repository (default: current directory)")
     p.add_argument("--base", help="base ref the work branched from (default: origin/HEAD, main or master)")
-    p.add_argument("--head", default="HEAD", help="ref holding the work to hand over (default: HEAD)")
+    p.add_argument("--head", default="HEAD", help="ref holding the work to hand over, or the code a --proposal is checked against (default: HEAD)")
+    p.add_argument("--proposal", metavar="PATH",
+                   help="review a proposal instead of a diff: one file or a folder, snapshotted into the bundle")
     p.add_argument("--task-linear", action="append", metavar="ID", help="Linear issue identifier (needs LINEAR_API_KEY)")
     p.add_argument("--task-file", action="append", metavar="PATH", help="task document (md/txt/json; Linear JSON export rendered)")
     p.add_argument("--task-text", action="append", metavar="TEXT", help="task description as text")
@@ -1051,8 +1206,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("review", help="peer review of the handed-over work (read-only, porch review)")
     p.add_argument("bundle")
     p.add_argument("-a", "--agents", help="comma-separated porch agent ids (default: porch enabled pool)")
-    p.add_argument("--kind", choices=["ask", "code"], default="ask",
-                   help="ask = task-aware review with the full brief (default); code = porch diff review")
+    p.add_argument("--kind", choices=["ask", "code", "proposal"],
+                   help="ask = task-aware review with the full brief (default); code = porch diff review; "
+                        "proposal = check a proposal against the code (default for a proposal bundle)")
     p.add_argument("--depth", choices=["basic", "specialists", "super", "ultra"], default="basic",
                    help="porch review code depth (kind=code)")
     p.add_argument("--progress", choices=["full", "compact", "none"], default="compact")

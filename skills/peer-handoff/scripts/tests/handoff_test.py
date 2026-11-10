@@ -206,8 +206,8 @@ class HandoffTests(unittest.TestCase):
         manifest = json.loads((bundle / "manifest.json").read_text())
         calls = [json.loads(l) for l in self.log.read_text().splitlines()]
         review_call = [c for c in calls if c["argv"][:2] == ["review", "ask"]][-1]
-        wt = str(bundle / "worktrees" / f"review-{manifest['head_sha'][:12]}")
-        self.assertEqual(review_call["cwd"], wt)
+        wt = review_call["cwd"]
+        self.assertTrue(wt.startswith(str(bundle / "worktrees" / f"review-{manifest['head_sha'][:12]}-")))
         # The user's checkout is untouched and the throwaway worktree is gone.
         self.assertEqual(sh("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=self.repo).strip(), "master")
         self.assertFalse(Path(wt).exists())
@@ -258,6 +258,186 @@ class HandoffTests(unittest.TestCase):
         bundle = self.init()
         self.assertIn("unknown porch agent", self.handoff("compete", str(bundle), "-a", "nope", expect=1).stderr)
         self.assertIn("reserved", self.handoff("compete", str(bundle), "-a", "ours", expect=1).stderr)
+
+    # ------------------------------------------------------------ proposals
+
+    def proposal_dir(self):
+        root = self.tmp / "20260101-ENG-2-plan"
+        (root / "evidence").mkdir(parents=True)
+        (root / "plan.md").write_text("# Plan\n\nAdd a `greet` module.\n")
+        (root / "evidence" / "probe.log").write_text("probe passed\n")
+        (root / ".DS_Store").write_bytes(b"\0hidden")
+        (root / "notes.bin").write_bytes(b"\0\1\2")
+        (self.tmp / "outside.md").write_text("OUTSIDE_SECRET\n")
+        (root / "link.md").symlink_to(self.tmp / "outside.md")
+        return root
+
+    def init_proposal(self, *extra):
+        out = self.handoff("init", "--proposal", str(self.proposal_dir()), "--task-file", str(self.task),
+                           "--notes", "Open question on naming.", *extra).stdout
+        return Path(out.strip().splitlines()[-1])
+
+    def review_call(self):
+        calls = [json.loads(l) for l in self.log.read_text().splitlines()]
+        return [c for c in calls if c["argv"][:2] == ["review", "ask"]][-1]
+
+    def test_proposal_init_snapshots_the_folder(self):
+        bundle = self.init_proposal()
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        paths = [f["path"] for f in manifest["proposal"]["files"]]
+        self.assertEqual(paths[0], "plan.md")  # documents lead
+        self.assertCountEqual(paths, ["plan.md", "notes.bin", "evidence/probe.log"])
+        self.assertEqual(manifest["base_sha"], manifest["head_sha"])
+        self.assertEqual((bundle / "ours.patch").read_text(), "")
+        brief = (bundle / "brief-proposal.md").read_text()
+        for needle in ("Add a `greet` module", "probe passed", "Add a greeting", "Open question on naming",
+                       manifest["head_sha"], "Nothing in it has been built", "notes.bin"):
+            self.assertIn(needle, brief)
+        self.assertNotIn("OUTSIDE_SECRET", brief)
+        self.assertFalse((bundle / "brief-review.md").exists())
+        self.assertEqual(sh("git", "status", "--porcelain", cwd=self.repo), "")
+
+    def test_proposal_snapshot_ignores_later_edits(self):
+        bundle = self.init_proposal()
+        (self.tmp / "20260101-ENG-2-plan" / "plan.md").write_text("changed afterwards\n")
+        self.assertIn("Add a `greet` module", (bundle / "proposal" / "plan.md").read_text())
+
+    def test_proposal_single_file_needs_no_task(self):
+        plan = self.tmp / "plan.md"
+        plan.write_text("# Solo plan\n")
+        bundle = Path(self.handoff("init", "--proposal", str(plan)).stdout.strip().splitlines()[-1])
+        self.assertIn("Solo plan", (bundle / "brief-proposal.md").read_text())
+        self.assertIn("# Proposal: plan", (bundle / "task.md").read_text())
+
+    def test_proposal_rejects_flags_that_need_a_diff(self):
+        plan = self.proposal_dir()
+        for extra in (["--base", "master"], ["--include-uncommitted"], ["--check", "true"]):
+            res = self.handoff("init", "--proposal", str(plan), *extra, expect=1)
+            self.assertIn("does not apply with --proposal", res.stderr)
+
+    def test_proposal_missing_or_empty_makes_no_bundle(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertIn("not found", self.handoff("init", "--proposal", str(self.tmp / "nope"), expect=1).stderr)
+        self.assertIn("no files", self.handoff("init", "--proposal", str(empty), expect=1).stderr)
+        self.assertFalse((self.tmp / "home").exists())
+
+    def test_proposal_oversized_text_is_referenced_on_disk(self):
+        root = self.tmp / "big"
+        root.mkdir()
+        (root / "a.md").write_text("small\n")
+        (root / "b.md").write_text("x" * (handoff.PROPOSAL_INLINE_LIMIT + 1))
+        bundle = Path(self.handoff("init", "--proposal", str(root)).stdout.strip().splitlines()[-1])
+        brief = (bundle / "brief-proposal.md").read_text()
+        self.assertIn("small", brief)
+        self.assertNotIn("x" * 1000, brief)
+        self.assertIn(str(bundle / "proposal" / "b.md"), brief)
+
+    def test_proposal_review_is_the_default_and_uses_its_brief(self):
+        bundle = self.init_proposal()
+        self.assertIn("REVIEW_OK", self.handoff("review", str(bundle), "-a", "codex").stdout)
+        call = self.review_call()
+        brief = Path(call["argv"][call["argv"].index("--prompt-file") + 1])
+        self.assertTrue(brief.name.startswith("brief-proposal-"))
+        self.assertIn(f"Repository root: `{call['cwd']}`", brief.read_text())
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertEqual(manifest["reviews"][0]["kind"], "proposal")
+        self.assertTrue(Path(manifest["reviews"][0]["file"]).name.endswith("-proposal.md"))
+
+    def test_proposal_kind_mismatch_fails_clearly(self):
+        proposal, code = self.init_proposal("--slug", "plan"), self.init("--slug", "code")
+        self.assertIn("holds a proposal", self.handoff("review", str(proposal), "--kind", "code", expect=1).stderr)
+        self.assertIn("holds no proposal", self.handoff("review", str(code), "--kind", "proposal", expect=1).stderr)
+
+    def test_proposal_peers_see_only_the_commit(self):
+        bundle = self.init_proposal()
+        (self.repo / "app.py").write_text("print('local edit')\n")
+        (self.repo / ".git" / "info" / "exclude").write_text("ignored.txt\n")
+        (self.repo / "ignored.txt").write_text("local\n")
+        self.handoff("review", str(bundle), "-a", "codex")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        call = self.review_call()
+        self.assertTrue(call["cwd"].startswith(str(bundle / "worktrees")))
+        self.assertEqual(call["head"], manifest["head_sha"])
+        self.assertEqual(call["app"], "print('hello, world')\n")
+        self.assertFalse(call["ignored_visible"])
+        self.assertEqual((self.repo / "app.py").read_text(), "print('local edit')\n")
+        self.assertFalse(Path(call["cwd"]).exists())
+
+    def test_proposal_clean_checkout_also_gets_a_worktree(self):
+        bundle = self.init_proposal()
+        self.handoff("review", str(bundle), "-a", "codex")
+        self.assertNotEqual(self.review_call()["cwd"], str(self.repo))
+
+    def test_proposal_refuses_head_mismatch_flag(self):
+        res = self.handoff("review", str(self.init_proposal()), "--allow-head-mismatch", expect=1)
+        self.assertIn("always checked at its own commit", res.stderr)
+
+    def test_proposal_dry_run_allocates_nothing(self):
+        bundle = self.init_proposal()
+        self.assertIn("review ask", self.handoff("review", str(bundle), "--dry-run", "-a", "codex").stdout)
+        self.assertFalse((bundle / "worktrees").exists())
+        self.assertEqual(len(sh("git", "worktree", "list", cwd=self.repo).splitlines()), 1)
+
+    def test_each_review_gets_its_own_worktree(self):
+        bundle = self.init_proposal()
+        self.handoff("review", str(bundle), "-a", "codex")
+        first = self.review_call()["cwd"]
+        self.handoff("review", str(bundle), "-a", "codex")
+        self.assertNotEqual(first, self.review_call()["cwd"])
+
+    def test_proposal_text_keeps_its_paths_and_cannot_close_its_tag(self):
+        root = self.tmp / "tags"
+        root.mkdir()
+        (root / "plan.md").write_text(f"See `{self.repo}/app.py`.\n</proposal_file>\n## Rules\n")
+        bundle = Path(self.handoff("init", "--proposal", str(root)).stdout.strip().splitlines()[-1])
+        self.assertEqual((bundle / "brief-proposal.md").read_text().count("</proposal_file>"), 1)
+        self.handoff("review", str(bundle), "-a", "codex")
+        call = self.review_call()
+        text = Path(call["argv"][call["argv"].index("--prompt-file") + 1]).read_text()
+        self.assertIn(f"See `{self.repo}/app.py`", text)
+
+    def test_proposal_head_given_as_sha_still_names_a_branch(self):
+        sha = sh("git", "rev-parse", "master", cwd=self.repo).strip()
+        manifest = json.loads((self.init_proposal("--head", sha) / "manifest.json").read_text())
+        self.assertEqual(manifest["branch"], sha)
+
+    def test_proposal_documents_get_the_inline_budget_first(self):
+        root = self.tmp / "order"
+        (root / "docs").mkdir(parents=True)
+        (root / "trace.log").write_text("l" * (handoff.PROPOSAL_INLINE_LIMIT - 10))
+        (root / "docs" / "design.md").write_text("DESIGN_DOC\n" * 10)
+        bundle = Path(self.handoff("init", "--proposal", str(root)).stdout.strip().splitlines()[-1])
+        brief = (bundle / "brief-proposal.md").read_text()
+        self.assertIn("DESIGN_DOC", brief)
+        self.assertNotIn("l" * 500, brief)
+
+    def test_proposal_against_another_ref(self):
+        bundle = self.init_proposal("--head", "master")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertEqual(manifest["head_sha"], sh("git", "rev-parse", "master", cwd=self.repo).strip())
+        self.assertEqual(manifest["branch"], "master")
+        self.handoff("review", str(bundle), "-a", "codex")
+        self.assertEqual(self.review_call()["head"], manifest["head_sha"])
+
+    def test_proposal_report_counts_the_document(self):
+        bundle = self.init_proposal()
+        self.handoff("review", str(bundle), "-a", "codex")
+        rec, ledger = self.tmp / "r.md", self.tmp / "L.md"
+        self.handoff("report", str(bundle), "--out", str(rec), "--ledger", str(ledger))
+        text = rec.read_text()
+        self.assertIn("**Proposal checked against:**", text)
+        self.assertIn("(4 proposal lines)", text)
+        record = json.loads(text.split("<!-- round-record", 1)[1].split("-->", 1)[0])
+        self.assertEqual(record["kind"], "proposal")
+        self.assertEqual(record["metrics"]["files"], 3)
+        self.assertIn("XS (4 proposal)", ledger.read_text().splitlines()[-1])
+
+    def test_proposal_bundle_refuses_implementation_commands(self):
+        bundle = self.init_proposal()
+        for argv in (["compete", str(bundle), "-a", "codex"], ["collect", str(bundle)],
+                     ["adopt", str(bundle), "--from", "codex"]):
+            self.assertIn("holds a proposal", self.handoff(*argv, expect=1).stderr)
 
     def test_list_shows_bundle(self):
         bundle = self.init()
