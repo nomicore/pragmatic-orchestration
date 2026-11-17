@@ -939,6 +939,15 @@ if text: open(sys.argv[2],"w",encoding="utf-8").write(text)
                 # Plain-text fallback when the stream is not JSON.
                 cat "$RAW_STREAM" > "$FINAL_TEXT"
             fi
+            # OpenCode 2.x can exit non-zero, with nothing on stderr, after the
+            # model has finished (seen on long tool-heavy reviews). Its own last
+            # record is authoritative: a final step_finish with reason "stop",
+            # no later error, and an answer on disk means the run completed.
+            if [[ "$exit_code" -ne 0 && -s "$FINAL_TEXT" && -s "$RAW_STREAM" ]] \
+                && python3 "$LIB_DIR/opencode_completed.py" "$RAW_STREAM"; then
+                echo "[porch] opencode exited $exit_code after a completed answer (last step: stop); keeping the answer" >&2
+                exit_code=0
+            fi
             ;;
         gemini-cli)
             # Backend identity is gemini-cli (not plain); plain-text behaviour retained.

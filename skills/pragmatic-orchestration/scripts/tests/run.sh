@@ -1898,6 +1898,13 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "=== OpenCode 2.x exit handling (offline) ==="
+if PYTHONDONTWRITEBYTECODE=1 python3 "$TESTS_DIR/opencode_exit_test.py" -v; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+fi
+
 echo "=== Antigravity backend (offline) ==="
 if PYTHONDONTWRITEBYTECODE=1 python3 "$TESTS_DIR/antigravity_test.py" -v; then
   PASS=$((PASS + 1))

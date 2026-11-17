@@ -481,6 +481,18 @@ def normalize_opencode(obj: Dict[str, Any]) -> tuple[str, Any]:
             text = part["text"]
         if text:
             return "text", text
+    # OpenCode 2.x `run --format json`: step_start / tool_use / step_finish.
+    # These are known lifecycle events, not protocol drift.
+    if typ == "tool_use" and isinstance(part, dict):
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        status = str(state.get("status") or "")
+        name = str(part.get("tool") or "tool")
+        if status in ("completed", "error"):
+            return "tool_completed", f"{name} {status}"
+        return "tool_started", name
+    if typ in ("step_start", "step_finish"):
+        reason = part.get("reason") if isinstance(part, dict) else None
+        return "progress", f"{typ} {reason}" if reason else typ
     if typ == "session.idle":
         # Idle is a turn-liveness signal, not proof that the one-shot process
         # has emitted all answer bytes or completed its lifecycle.

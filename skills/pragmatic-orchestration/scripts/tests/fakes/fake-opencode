@@ -32,6 +32,17 @@ if printf '%s\n' "$@" | grep -qx -- 'json' || printf '%s\n' "$@" | grep -q -- '-
   # emit json when format json requested
   for a in "$@"; do
     if [[ "$a" == "json" ]]; then
+      if [[ -n "${PORCH_FAKE_OPENCODE_V2_EXIT:-}" ]]; then
+        # OpenCode 2.x run --format json: step/tool records, then a final step
+        # whose reason is PORCH_FAKE_OPENCODE_V2_LAST (default stop).
+        echo '{"type":"step_start","part":{"type":"step-start"}}'
+        echo '{"type":"tool_use","part":{"type":"tool","tool":"shell","state":{"status":"completed"}}}'
+        echo '{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls"}}'
+        echo '{"type":"step_start","part":{"type":"step-start"}}'
+        echo '{"type":"text","part":{"id":"p1","type":"text","text":"FAKE_OPENCODE_V2_REPORT"}}'
+        echo "{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"${PORCH_FAKE_OPENCODE_V2_LAST:-stop}\"}}"
+        exit "$PORCH_FAKE_OPENCODE_V2_EXIT"
+      fi
       if [[ -n "${PORCH_FAKE_OPENCODE_IDLE_BEFORE_TEXT:-}" ]]; then
         echo '{"type":"session.idle"}'
       fi
