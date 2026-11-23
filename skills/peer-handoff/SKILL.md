@@ -58,6 +58,21 @@ The bundle holds `task.md`, `context.md`, `work.md`, `ours.patch`, the
 generated briefs (a proposal bundle: see 2d) and `manifest.json`. Read `brief-review.md` once before
 launching anything: it is exactly what peers receive.
 
+## 1b. Check the peers before paying for a round
+
+```bash
+"$HANDOFF" preflight                                   # enabled pool: ids, CLIs on PATH, disabled peers
+"$HANDOFF" preflight -a codex,antigravity --ping       # plus a one-line question to each peer
+"$HANDOFF" preflight --bundle "$BUNDLE"                # plus brief size and secret-looking strings
+"$HANDOFF" preflight --refuse 'opencode-*-gemini-*'    # fail if a peer you must not use is selected
+```
+
+`preflight` fails on an unknown id, a peer whose CLI is missing (a review
+without `-a` would skip it silently), a peer matching `--refuse`, a failed
+ping, or a secret in the bundle. It warns on a disabled peer passed with `-a`,
+on common tool folders missing from PATH, and on a brief above 60 KB: every
+peer re-reads the brief on each turn, so a big brief multiplies the cost.
+
 ## 2a. Peer review of your work
 
 ```bash
@@ -78,6 +93,26 @@ launching anything: it is exactly what peers receive.
 - Every review also records what each peer cost, in
   `$BUNDLE/reviews/<stamp>-<kind>.usage.json`, and prints the table. See
   section 2c.
+- `--peer-timeout MIN` stops a peer still running after MIN minutes and
+  records it as failed, so one slow peer does not hold the round (kinds `ask`
+  and `proposal`; porch's `PORCH_AGENT_TIMEOUT`). A stopped peer may still
+  have billed tokens.
+- The briefs tell peers to use their own test database or skip DB-backed
+  tests, never to call paid or production APIs, to treat decisions marked
+  settled as settled, and to give the smallest reproduction per finding.
+  State settled decisions and your open doubts in `--notes`; ask neutral
+  questions ("is X correct?" invites a yes).
+
+### Follow-up round on the fixes
+
+```bash
+BUNDLE2=$("$HANDOFF" init --previous "$BUNDLE" --open-findings open.md --notes "What I fixed")
+```
+
+The base becomes the previous round's head commit, so peers see only the
+fixes and anything new; the task is reused unless you pass one; the brief
+says what the earlier round covered and lists the findings the fixes answer.
+Later rounds often catch regressions introduced by the fixes themselves.
 
 ## 2d. Peer review of a proposal, before anything is built
 
@@ -147,7 +182,19 @@ Once you have verified the claims and acted on them, fill the record in:
 
 1. **`findings` in the JSON block:** one entry per claim any peer made,
    including the ones you rejected. Merge duplicates into one entry and list
-   everyone who raised it.
+   everyone who raised it. Start from a draft:
+
+   ```bash
+   "$HANDOFF" draft-findings "$BUNDLE" --out draft.json
+   # verify each claim, fix rows, set severity, category, verdict, outcome, note
+   "$HANDOFF" findings <record> --from draft.json
+   ```
+
+   `draft-findings` reads each peer's final answer, takes every item under a
+   finding-like heading as a claim, and merges claims that read alike across
+   peers. The merge and the guessed severity and category are a starting
+   point: split, join or delete rows as the evidence says. `--from` refuses
+   rows without verdict or outcome and drops the excerpts.
 
    | Field | Values |
    |---|---|

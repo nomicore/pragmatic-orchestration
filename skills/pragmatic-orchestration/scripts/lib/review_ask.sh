@@ -304,12 +304,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Per-agent deadline: PORCH_AGENT_TIMEOUT=SEC (default 0 = none). An agent still
+# running SEC seconds after launch is stopped with its process tree and reported
+# as failed (exit 124), so one slow peer cannot hold back the whole report.
+_ASK_TIMEOUT="${PORCH_AGENT_TIMEOUT:-0}"
+if ! [[ "$_ASK_TIMEOUT" =~ ^[0-9]+$ ]]; then _ASK_TIMEOUT=0; fi
+TIMED_OUT=()
+for i in "${!AGENT_IDS[@]}"; do TIMED_OUT+=("0"); done
+
+_kill_tree() {
+    local p="$1" c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
+    kill -TERM "$p" 2>/dev/null || true
+}
+
+if [[ "$_ASK_TIMEOUT" -gt 0 ]]; then
+    _deadline=$(( $(date +%s) + _ASK_TIMEOUT ))
+    while true; do
+        alive=0
+        for p in "${PIDS[@]:-}"; do
+            [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && alive=$((alive + 1))
+        done
+        [[ "$alive" -eq 0 ]] && break
+        if [[ "$(date +%s)" -ge "$_deadline" ]]; then
+            for i in "${!AGENT_IDS[@]}"; do
+                p="${PIDS[$i]}"
+                if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+                    TIMED_OUT[$i]="1"
+                    _kill_tree "$p"
+                    printf 'porch: stopped after PORCH_AGENT_TIMEOUT=%ss\n' "$_ASK_TIMEOUT" >> "${ERR_FILES[$i]}"
+                    progress_info "timeout" "agent=${AGENT_IDS[$i]} after=${_ASK_TIMEOUT}s"
+                fi
+            done
+            break
+        fi
+        sleep 1
+    done
+fi
+
 for i in "${!AGENT_IDS[@]}"; do
     pid="${PIDS[$i]}"
     [[ -z "$pid" ]] && continue
     code=0
     # Wait on the enclosing subshell (pipeline + tee already drained inside it).
     wait "$pid" || code=$?
+    [[ "${TIMED_OUT[$i]}" == "1" ]] && code=124
     EXITS[$i]="$code"
     out_bytes=$(wc -c < "${OUT_FILES[$i]}" | tr -d ' ')
     if [[ $code -eq 0 && $out_bytes -gt 0 ]]; then

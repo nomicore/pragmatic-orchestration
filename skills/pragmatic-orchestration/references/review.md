@@ -122,7 +122,7 @@ useful.
 | `compact` | Content-free liveness counters only |
 | `none` | No stage, pass, or model progress; failures and stdout report remain |
 
-Invocation-specific keys distinguish parallel passes of the same agent and match their artifact keys. Large fan-outs can set `PORCH_MAX_PARALLEL=N`; `0` is unlimited and remains the default.
+Invocation-specific keys distinguish parallel passes of the same agent and match their artifact keys. Large fan-outs can set `PORCH_MAX_PARALLEL=N`; `0` is unlimited and remains the default. `PORCH_AGENT_TIMEOUT=SEC` bounds each `review ask` agent; one that runs longer is stopped and reported failed.
 
 ## Exit codes
 

@@ -97,6 +97,7 @@ mechanical read-only boundary is required for untrusted repositories.
 |---|---|
 | `PORCH_MAX_PARALLEL=0` | Unlimited jobs; default and historical behavior |
 | `PORCH_MAX_PARALLEL=N` | At most N ask/discovery/specialist jobs concurrently |
+| `PORCH_AGENT_TIMEOUT=SEC` | `review ask` stops an agent still running SEC seconds after launch, with its process tree; it is reported `failed` with exit 124 and the other agents' answers are kept |
 
 Stage order, partial/all-failed exit semantics, artifact keys, live progress, and independent outputs remain deterministic.
 

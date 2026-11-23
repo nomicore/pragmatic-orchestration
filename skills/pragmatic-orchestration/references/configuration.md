@@ -140,6 +140,7 @@ must not reinterpret such a path as an instruction to read stdin.
 | `PORCH_SAVE_OUTPUTS` | Disable ordinary archival with `0`; steerable service artifacts remain |
 | `PORCH_STEER_DIR` | Steerable registry; reuse the same value for every control command |
 | `PORCH_MAX_PARALLEL` | Fan-out concurrency; `0` means unlimited/default |
+| `PORCH_AGENT_TIMEOUT` | `review ask`: seconds before a still-running agent is stopped and reported failed (exit 124); `0` or unset means no limit |
 | `PORCH_DEBUG_EVENTS*` | Opt-in bounded event tape and its path/record/byte limits |
 | `GEMINI_API_KEY` | Gemini CLI authentication when required |
 

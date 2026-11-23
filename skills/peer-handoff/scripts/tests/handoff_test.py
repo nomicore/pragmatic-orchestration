@@ -536,6 +536,127 @@ class HandoffTests(unittest.TestCase):
                      ["adopt", str(bundle), "--from", "codex"]):
             self.assertIn("holds a proposal", self.handoff(*argv, expect=1).stderr)
 
+    # ------------------------------------------------------------ preflight
+
+    def test_preflight_flags_missing_cli_disabled_and_refused_peers(self):
+        res = self.handoff("preflight", expect=1)  # enabled pool holds grok, whose CLI is missing
+        self.assertIn("| codex | codex-cli |", res.stdout)
+        self.assertIn("grok: its CLI is not installed", res.stderr)
+        res = self.handoff("preflight", "-a", "codex,antigravity")
+        self.assertIn("antigravity: disabled in the config", res.stderr)
+        self.assertIn("preflight ok: 2 peer(s), 1 warning(s)", res.stderr)
+        res = self.handoff("preflight", "-a", "codex,oc-kimi-k3.1", "--refuse", "oc-*", expect=1)
+        self.assertIn("oc-kimi-k3.1: refused by --refuse oc-*", res.stderr)
+        res = self.handoff("preflight", "-a", "codex,nope", expect=1)
+        self.assertIn("nope: unknown peer id", res.stderr)
+
+    def test_preflight_ping_and_bundle_scan(self):
+        res = self.handoff("preflight", "-a", "codex", "--ping")
+        self.assertIn("ping codex: answered", res.stdout)
+        bundle = self.init("--notes", "token ghp_" + "a" * 36)
+        res = self.handoff("preflight", "-a", "codex", "--ping", "--bundle", str(bundle),
+                           "--max-brief-kb", "0", expect=1)
+        self.assertIn("looks like a GitHub token", res.stderr)
+        self.assertRegex(res.stderr, r"brief-review\.md is \d+ KB")
+        self.assertNotIn("ping codex", res.stdout)  # no paid ping once a problem is known
+
+    # ------------------------------------------------------------ peer timeout
+
+    def test_review_peer_timeout_reaches_porch(self):
+        bundle = self.init()
+        out = self.handoff("review", str(bundle), "-a", "codex", "--peer-timeout", "20", "--dry-run").stdout
+        self.assertIn("# each peer is stopped after 20 min", out)
+        self.handoff("review", str(bundle), "-a", "codex", "--peer-timeout", "20")
+        asks = lambda: [json.loads(l) for l in self.log.read_text().splitlines() if '"review", "ask"' in l]
+        self.assertEqual(asks()[-1]["agent_timeout"], "1200")
+        self.handoff("review", str(bundle), "-a", "codex")
+        self.assertIsNone(asks()[-1]["agent_timeout"])
+        res = self.handoff("review", str(bundle), "--kind", "code", "--peer-timeout", "5", expect=1)
+        self.assertIn("applies to --kind ask and proposal", res.stderr)
+
+    # ------------------------------------------------------------ follow-up rounds
+
+    def test_previous_round_reviews_only_the_fixes(self):
+        first = self.init()
+        g = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        (self.repo / "app.py").write_text("print('hello, world!')\n")
+        sh(*g, "commit", "-qam", "Fix punctuation", cwd=self.repo)
+        open_findings = self.tmp / "open.md"
+        open_findings.write_text("1. Greeting lacks punctuation (codex)\n")
+        out = self.handoff("init", "--previous", str(first), "--open-findings", str(open_findings)).stdout
+        second = Path(out.strip().splitlines()[-1])
+        m1 = json.loads((first / "manifest.json").read_text())
+        m2 = json.loads((second / "manifest.json").read_text())
+        self.assertEqual(m2["base_sha"], m1["head_sha"])
+        self.assertEqual(m2["previous"], m1["id"])
+        brief = (second / "brief-review.md").read_text()
+        for needle in ("Add a greeting", "Follow-up round", "Greeting lacks punctuation", "Fix punctuation"):
+            self.assertIn(needle, brief)
+        commits = (second / "work.md").read_text().split("### Commits since base", 1)[1].split("###", 1)[0]
+        self.assertNotIn("Add greeting", commits)
+        res = self.handoff("init", "--open-findings", str(open_findings), "--task-text", "x", expect=1)
+        self.assertIn("--open-findings needs --previous", res.stderr)
+        res = self.handoff("init", "--previous", str(first), "--proposal", str(self.task), expect=1)
+        self.assertIn("for a revised proposal", res.stderr)
+
+    def test_uncommitted_diffstat_names_untracked_files(self):
+        (self.repo / "new_module.py").write_text("x = 1\n")
+        bundle = self.init("--include-uncommitted")
+        self.assertIn("new_module.py (new, untracked)", (bundle / "work.md").read_text())
+
+    # ------------------------------------------------------------ draft findings
+
+    def _review_with_answers(self, answers):
+        bundle = self.init()
+        self.handoff("review", str(bundle), "-a", "codex,oc-kimi-k3.1")
+        run_dir = Path(json.loads((bundle / "manifest.json").read_text())["reviews"][-1]["run_dir"])
+        (run_dir / "final").mkdir(parents=True, exist_ok=True)
+        for peer, text in answers.items():
+            (run_dir / "final" / f"{peer}.txt").write_text(text)
+        return bundle
+
+    def test_draft_findings_merges_alike_claims_and_imports(self):
+        bundle = self._review_with_answers({
+            "codex": ("## Assessment\nGo with changes.\n\n## Key Findings\n"
+                      "1. **Major:** app.py:1 prints the greeting without punctuation, so the output "
+                      "does not match the task wording.\n"
+                      "2. Minor: there is no test for the greeting output in tests/test_app.py.\n"),
+            "oc-kimi-k3.1": ("## Findings\n- Critical: app.py:1 greeting printed without punctuation; "
+                             "output does not match the task wording.\n"
+                             "- A secret token is logged by the auth helper in auth.py:10 when login fails.\n"),
+        })
+        draft = self.tmp / "draft.json"
+        self.handoff("draft-findings", str(bundle), "--out", str(draft))
+        data = json.loads(draft.read_text())
+        self.assertEqual(data["peers"], ["codex", "oc-kimi-k3.1"])
+        self.assertIn("critical", data["allowed"]["severity"])
+        rows = data["findings"]
+        self.assertEqual(len(rows), 3, rows)
+        merged = rows[0]
+        self.assertEqual(merged["raised_by"], ["codex", "oc-kimi-k3.1"])
+        self.assertEqual(merged["severity"], "major")
+        self.assertEqual(rows[1]["category"], "tests")
+        self.assertEqual(rows[2]["category"], "security")
+        self.assertIsNone(rows[2]["verdict"])
+
+        rec = self.tmp / "r1.md"
+        self.handoff("report", str(bundle), "--out", str(rec))
+        res = self.handoff("findings", str(rec), "--from", str(draft), expect=1)
+        self.assertIn("set verdict and outcome on every row first", res.stderr)
+        for row, (verdict, outcome) in zip(rows, [("true", "fixed"), ("true", "deferred"), ("false", "rejected")]):
+            row.update(verdict=verdict, outcome=outcome)
+        draft.write_text(json.dumps(data))
+        out = self.handoff("findings", str(rec), "--from", str(draft)).stdout
+        self.assertIn("codex", out)
+        record = json.loads(rec.read_text().split("<!-- round-record", 1)[1].split("-->", 1)[0])
+        self.assertEqual(len(record["findings"]), 3)
+        self.assertNotIn("excerpts", record["findings"][0])
+
+    def test_draft_findings_needs_answers(self):
+        bundle = self.init()
+        res = self.handoff("draft-findings", str(bundle), expect=1)
+        self.assertIn("no peer answers", res.stderr)
+
     def test_list_shows_bundle(self):
         bundle = self.init()
         self.assertIn(bundle.name, self.handoff("list").stdout)

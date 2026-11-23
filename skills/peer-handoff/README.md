@@ -51,11 +51,14 @@ answers by hand.
 | Command | What it does |
 |---|---|
 | `handoff init` | Build a bundle from the task (`--task-linear`, `--task-file`, `--task-text`), context (`--context-file`, `--context-note`), notes and acceptance checks; `--include-uncommitted` hands over the working tree as it is |
+| `handoff init --previous BUNDLE` | Follow-up round: base is the previous round's head, its task is reused, the brief names what the earlier round covered; `--open-findings FILE` adds the findings the fixes answer |
+| `handoff preflight` | Before a paid round: each peer's id, model, enabled state and whether its CLI is on PATH; `--refuse GLOB` for peers you must not use, `--ping` for a one-line answer from each, `--bundle` for brief size and secret-looking strings |
 | `handoff init --proposal PATH` | Bundle for a proposal instead of a diff: snapshots one file or a folder; `--repo` and `--head` choose the code it is checked against |
-| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default), porch diff review (`--kind code --depth …`), or a check of a proposal against the code (`--kind proposal`, default for proposal bundles); refuses an `-a` id porch does not know or whose CLI is missing (porch itself would skip it without a warning); `--dry-run` prints the resolved peers and the command; records each peer's tokens and cost |
+| `handoff review BUNDLE` | Task-aware review (`--kind ask`, default), porch diff review (`--kind code --depth …`), or a check of a proposal against the code (`--kind proposal`, default for proposal bundles); refuses an `-a` id porch does not know or whose CLI is missing (porch itself would skip it without a warning); `--dry-run` prints the resolved peers and the command; records each peer's tokens and cost; `--peer-timeout MIN` stops a peer that runs longer and records it failed |
 | `handoff cost BUNDLE` | Tokens, time and cost per peer across the bundle's reviews (`--json`) |
 | `handoff report BUNDLE` | Round record: change size and components, task size, ambiguity, cost per peer; `--ledger` appends a summary row |
-| `handoff findings RECORD` | Checks the findings the orchestrator listed in a round record (severity, category, verdict, outcome, who raised and reproduced each) and writes the per-peer score into the record |
+| `handoff draft-findings BUNDLE` | Draft findings list from the peers' final answers: one row per claim, alike claims merged across peers, guessed severity and category, allowed values listed |
+| `handoff findings RECORD` | Checks the findings the orchestrator listed in a round record (severity, category, verdict, outcome, who raised and reproduced each) and writes the per-peer score into the record; `--from FILE` imports a completed draft |
 | `handoff scoreboard PATH…` | Value per model across round records: rounds, failed runs, spent, plan equivalent, real, unique, false and security findings, adopted, discarded, score, dollars per point (`--json`, `--out`) |
 | `handoff compete BUNDLE -a a,b,c` | One worktree + branch per agent at the base commit; launch each peer on the implement brief |
 | `handoff status BUNDLE` | State of every competing worker |

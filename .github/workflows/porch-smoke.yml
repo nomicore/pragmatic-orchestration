@@ -74,6 +74,10 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/tests/run.sh
 
+      - name: Per-agent review timeout
+        if: runner.os != 'Windows'
+        run: bash scripts/tests/agent_timeout_test.sh
+
   peer-handoff:
     name: peer-handoff (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

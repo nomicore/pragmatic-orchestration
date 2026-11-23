@@ -21,8 +21,13 @@ reviews, the orchestrator lists every finding in the record; `findings` checks
 that list and scores each peer, and `scoreboard` adds up value, cost and
 failures per model across all round records (see findings.py).
 
-Commands: init, review, cost, report, findings, scoreboard, compete, status,
-collect, adopt, cleanup, list.
+`preflight` checks the peers before a round is paid for, `review --peer-timeout`
+stops a peer that runs too long, `init --previous` builds a follow-up round on
+the fixes only, and `draft-findings` turns the peers' answers into a draft
+findings list for `findings --from`.
+
+Commands: init, preflight, review, cost, report, draft-findings, findings,
+scoreboard, compete, status, collect, adopt, cleanup, list.
 Run `handoff <command> --help` for options. Standard library only.
 """
 from __future__ import annotations
@@ -37,6 +42,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -393,6 +399,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).resolve())
     proposal_pairs: Optional[List[tuple]] = None
     proposal_source: Optional[Path] = None
+    previous: Optional[Dict[str, Any]] = None
+    previous_bundle: Optional[Path] = None
+    if args.open_findings and not args.previous:
+        raise HandoffError("--open-findings needs --previous")
+    if args.previous:
+        if args.proposal:
+            raise HandoffError("--previous builds a follow-up review of fixes; for a revised proposal run "
+                               "`init --proposal` again on the new version")
+        previous_bundle = resolve_bundle(args.previous)
+        previous = load_manifest(previous_bundle)
+        if previous.get("proposal"):
+            raise HandoffError(f"{previous['id']} is a proposal bundle; --previous takes a code review bundle")
+        if Path(previous["repo"]).resolve() != repo:
+            raise HandoffError(f"{previous['id']} belongs to {previous['repo']}, not {repo}")
+        if not args.base:
+            args.base = previous["head_sha"]
     if args.proposal:
         for given, flag in ((args.base, "--base"), (args.include_uncommitted, "--include-uncommitted"),
                             (args.check, "--check")):
@@ -426,6 +448,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         task_parts.append(t.rstrip() + "\n")
         task_sources.append("text")
         title_hint = title_hint or t[:60]
+    if not task_parts and previous_bundle is not None:
+        task_parts.append((previous_bundle / "task.md").read_text(encoding="utf-8").rstrip() + "\n")
+        task_sources.append(f"previous:{previous['id']}")
+        title_hint = title_hint or previous["id"].split("-", 2)[-1]
     if not task_parts:
         if proposal_source is None:
             raise HandoffError("no task: pass --task-linear, --task-file or --task-text")
@@ -462,6 +488,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8")
     if args.notes:
         notes = (notes + "\n" + args.notes).strip()
+    if previous is not None:
+        follow = [
+            "### Follow-up round",
+            "",
+            f"An earlier round (`{previous['id']}`) reviewed `{previous['base_sha'][:12]}..{previous['head_sha'][:12]}`. "
+            f"This round reviews only what changed since `{previous['head_sha'][:12]}`: the fixes for that "
+            "round's findings and anything new. Check that each fix really closes its finding, look for "
+            "regressions the fixes introduce, and do not repeat findings the fixes already address.",
+        ]
+        if previous.get("uncommitted"):
+            follow += ["", "The earlier round also covered uncommitted work; it is part of this diff again."]
+        if args.open_findings:
+            follow += ["", "#### Findings of the earlier round the fixes address", "",
+                       Path(args.open_findings).expanduser().read_text(encoding="utf-8").strip()]
+        notes = (notes + "\n\n" + "\n".join(follow)).strip()
 
     if proposal_pairs is not None:
         files = snapshot_proposal(proposal_pairs, bundle / "proposal")
@@ -490,6 +531,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     if uncommitted:
         # Base → working tree, plus untracked files: the work as it is on disk.
         stat = git(repo, "diff", "--stat", base_sha).strip()
+        new_files = [f for f in git(repo, "ls-files", "--others", "--exclude-standard", "-z").split("\0") if f]
+        if new_files:
+            stat = (stat + "\n" if stat else "") + "\n".join(f" {f} (new, untracked)" for f in new_files)
         patch = git(repo, "diff", "--binary", base_sha) + untracked_patch(repo)
     else:
         stat = git(repo, "diff", "--stat", f"{base_sha}..{head_sha}").strip()
@@ -517,6 +561,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "branch": branch, "task_sources": task_sources, "context_sources": ctx_sources,
         "checks": checks, "runs": {}, "reviews": [], "uncommitted": uncommitted,
     }
+    if previous is not None:
+        manifest["previous"] = previous["id"]
     write(bundle / "task.md", "\n\n".join(task_parts))
     write(bundle / "context.md", context_md)
     write(bundle / "work.md", work_md)
@@ -641,8 +687,17 @@ def cmd_review(args: argparse.Namespace) -> int:
     else:
         argv = [porch, "review", "code", "--diff", "--depth", args.depth, "--progress", args.progress, *agents]
         stdin = (bundle / "ours.patch").read_text(encoding="utf-8")
+    timeout_env: Dict[str, str] = {}
+    if args.peer_timeout:
+        if args.peer_timeout < 1:
+            raise HandoffError("--peer-timeout takes whole minutes, 1 or more")
+        if kind == "code":
+            raise HandoffError("--peer-timeout applies to --kind ask and proposal; porch review code has no per-peer limit")
+        timeout_env["PORCH_AGENT_TIMEOUT"] = str(args.peer_timeout * 60)
     if args.dry_run:
         print("# peers: " + (", ".join(peers) or "none enabled"))
+        if timeout_env:
+            print(f"# each peer is stopped after {args.peer_timeout} min")
         if review_wt is not None:
             print("# the worktree below is created only by a real run")
         print(f"cd {shlex.quote(str(review_root))} && {shlex.join(argv)}" + (" < ours.patch" if stdin else ""))
@@ -657,7 +712,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"[peer-handoff] {repo} is at {current[:12]}; reviewing {head[:12]} in {review_wt}", file=sys.stderr)
     # Keep porch's raw streams with the bundle: they carry each peer's token usage.
     run_dir = bundle / "runs" / f"{stamp}-{kind}"
-    env = dict(os.environ, PORCH_RUN_DIR=str(run_dir), PORCH_SAVE_OUTPUTS="1")
+    env = dict(os.environ, PORCH_RUN_DIR=str(run_dir), PORCH_SAVE_OUTPUTS="1", **timeout_env)
     try:
         proc = subprocess.run(argv, cwd=str(review_root), text=True, input=stdin if stdin is not None else "",
                               stdout=subprocess.PIPE, stderr=None, env=env)
@@ -801,9 +856,26 @@ def peer_status(manifest: Dict[str, Any], agent: str, only: Optional[Sequence[st
     return "failed"
 
 
+DRAFT_ONLY_KEYS = ("excerpts", "variants")
+
+
+def load_findings_file(path: Path) -> List[Dict[str, Any]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data.get("findings") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise HandoffError(f"{path}: expected a JSON list of findings or an object with a `findings` list")
+    todo = [str(r.get("id", "?")) for r in rows if r.get("verdict") is None or r.get("outcome") is None]
+    if todo:
+        raise HandoffError(f"{path}: set verdict and outcome on every row first; still empty on rows "
+                           + ", ".join(todo) + ". Delete rows that are not findings.")
+    return [{k: v for k, v in r.items() if k not in DRAFT_ONLY_KEYS} for r in rows]
+
+
 def cmd_findings(args: argparse.Namespace) -> int:
     path = Path(args.record).expanduser()
     text, record = findings.read_record(path)
+    if args.source:
+        record["findings"] = load_findings_file(Path(args.source).expanduser())
     if not isinstance(record.get("findings"), list):
         print(f"{path}: `findings` is not filled in yet (null); add the list to the JSON block", file=sys.stderr)
         return 2
@@ -819,6 +891,334 @@ def cmd_findings(args: argparse.Namespace) -> int:
     path.write_text(findings.put_round_score(text, scores), encoding="utf-8")
     print(findings.round_md(scores))
     return 0
+
+
+# ---------------------------------------------------------------- draft findings
+
+FINDING_HEADING = re.compile(r"finding|blind spot|missing|issue|risk|concern|problem|bug", re.I)
+HEADING_LINE = re.compile(r"^\s*(#{1,6})\s+(.*\S)")
+BOLD_LINE = re.compile(r"^\s*\*\*(.+?)\*\*[:.]?\s*$")
+ITEM_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.*\S)")
+SEVERITY_TAG = r"\[?(?:critical|blocker|major|minor|nit|high|medium|low)\]?"
+CLAIM_START = re.compile(rf"^\s*(?:\d+[.)]\s*|{SEVERITY_TAG}\b)", re.I)
+FIELD_LINE = re.compile(r"^\s*(?:[-*•]\s+)?[*_]*\s*(?:proposal section|sections?|evidence|details?|consequence|impact|"
+                        r"(?:concrete |suggested )?(?:change|fix)|severity|files?|location|why|reproduction|repro)"
+                        r"\s*[*_]*\s*:", re.I)
+TITLE_PREFIX = re.compile(rf"^\s*(?:\d+[.)]\s*)?(?:{SEVERITY_TAG}\s*[:·—–-]?\s*)?", re.I)
+WORD_RE = re.compile(r"[a-z0-9_./:-]{4,}")
+STOPWORDS = {"this", "that", "with", "from", "when", "into", "there", "their", "should", "would", "could",
+             "which", "while", "where", "also", "only", "does", "have", "they", "will", "than", "then",
+             "because", "before", "after", "under", "other", "these", "those", "must", "more", "being",
+             "proposal", "section", "evidence", "consequence", "change", "concrete", "detail"}
+SEVERITY_WORDS = (("critical", ("critical", "blocker", "severe")), ("major", ("major", "high")),
+                  ("nit", ("nit", "nitpick", "cosmetic")), ("minor", ("minor", "medium", "low")))
+CATEGORY_WORDS = (("security", ("security", "secret", "auth", "inject", "xss", "csrf", "permission", "leak")),
+                  ("tests", ("test", "tests", "coverage", "assert")),
+                  ("docs", ("readme", "docstring", "documentation", "comment")),
+                  ("performance", ("slow", "performance", "n+1", "latency", "memory")),
+                  ("ops", ("deploy", "terraform", "pipeline", "ci", "rollout", "migration")),
+                  ("reliability", ("retry", "timeout", "race", "crash", "flaky", "fallback")),
+                  ("design", ("design", "architecture", "coupling", "abstraction")))
+
+
+def _clean(text: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)  # Markdown links: keep the label only
+    text = re.sub(r"[`*_]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _guess(text: str, table) -> Optional[str]:
+    low = text.lower()
+    for value, words in table:
+        if any(re.search(rf"\b{re.escape(w)}\b", low) for w in words):
+            return value
+    return None
+
+
+def extract_claims(answer: str) -> List[tuple]:
+    """One (first line, full text) pair per claim under finding-like headings.
+
+    Peers write findings as numbered or bulleted items, as sub-headings or bold
+    numbered lines followed by labelled fields (Evidence:, Consequence:, Change:),
+    or as items with indented sub-bullets. Each becomes one claim with its fields.
+    """
+    claims_parts: List[List[str]] = []
+    in_section = False
+    section_level = 0
+    current: Optional[List[str]] = None
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            claims_parts.append(current)
+        current = None
+
+    for line in answer.splitlines():
+        h = HEADING_LINE.match(line)
+        if h:
+            level, text = len(h.group(1)), h.group(2)
+            if in_section and level > section_level:
+                flush()
+                current = [text]
+                continue
+            flush()
+            in_section, section_level = bool(FINDING_HEADING.search(text)), level
+            continue
+        b = BOLD_LINE.match(line)
+        if b and not FIELD_LINE.match(line):
+            text = b.group(1)
+            if in_section and CLAIM_START.match(text):
+                flush()
+                current = [text]
+            else:
+                flush()
+                if FINDING_HEADING.search(text) and not in_section:
+                    in_section, section_level = True, 7
+            continue
+        if not in_section:
+            continue
+        if current is not None and FIELD_LINE.match(line):
+            current.append(line.strip())
+            continue
+        m = ITEM_RE.match(line)
+        indented = line[:1] in (" ", "\t")
+        if m and not (indented and current is not None):
+            flush()
+            current = [m.group(1)]
+        elif current is not None and line.strip():
+            current.append(line.strip())
+    flush()
+    out = []
+    for parts in claims_parts:
+        full = _clean(" ".join(parts))
+        if len(full) >= 25:
+            out.append((_clean(parts[0]), full))
+    return out
+
+
+def _tokens(text: str) -> set:
+    return {w.strip(".:-") for w in WORD_RE.findall(text.lower())} - STOPWORDS
+
+
+def _title(head: str) -> str:
+    rest = TITLE_PREFIX.sub("", head, count=1).strip()
+    first = re.split(r"(?<=[a-z0-9)\"'”][.!?])\s", rest, maxsplit=1)[0]
+    if len(first) < 40:
+        first = rest
+    return first[:160].rstrip()
+
+
+IDENT_RE = re.compile(r"[\w./-]*\d[\w./:-]*|\w+_\w+|[\w/-]+\.\w{1,5}\b")
+
+
+def _idents(text: str) -> set:
+    return {m.strip(".:-").lower() for m in IDENT_RE.findall(text) if len(m.strip(".:-")) >= 2}
+
+
+def _similarity(a: Dict[str, set], b: Dict[str, set]) -> float:
+    """Title overlap, full-text overlap and shared identifiers (paths, ids with digits, dates).
+    Tuned on real six-peer rounds: alike claims score about 0.6 and more."""
+    title = len(a["title"] & b["title"]) / max(min(len(a["title"]), len(b["title"])), 1)
+    full = len(a["full"] & b["full"]) / max(len(a["full"] | b["full"]), 1)
+    ids = (len(a["ids"] & b["ids"]) / max(min(len(a["ids"]), len(b["ids"])), 1)) if a["ids"] and b["ids"] else 0.0
+    return 0.5 * title + full + 0.3 * ids
+
+
+MERGE_THRESHOLD = 0.5
+
+
+def draft_findings(answers: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Claims from every peer, merged when they read alike. A guess the orchestrator corrects.
+
+    Every pair of claims from different peers is scored, then clusters are joined from the most
+    alike pair down, never putting two claims of one peer in the same cluster.
+    """
+    claims = []
+    for peer, answer in answers.items():
+        for head, text in extract_claims(answer):
+            claims.append({"peer": peer, "head": head, "text": text, "title": _title(head),
+                           "sig": {"title": _tokens(_title(head)), "full": _tokens(text),
+                                   "ids": _idents(head + " " + text[:300])}})
+    cluster = list(range(len(claims)))
+    members: Dict[int, List[int]] = {i: [i] for i in range(len(claims))}
+    pairs = []
+    for i in range(len(claims)):
+        for j in range(i + 1, len(claims)):
+            if claims[i]["peer"] != claims[j]["peer"]:
+                score = _similarity(claims[i]["sig"], claims[j]["sig"])
+                if score >= MERGE_THRESHOLD:
+                    pairs.append((score, i, j))
+    for _score, i, j in sorted(pairs, key=lambda p: -p[0]):
+        a, b = cluster[i], cluster[j]
+        if a == b:
+            continue
+        if {claims[k]["peer"] for k in members[a]} & {claims[k]["peer"] for k in members[b]}:
+            continue
+        keep, gone = min(a, b), max(a, b)
+        for k in members[gone]:
+            cluster[k] = keep
+        members[keep] += members.pop(gone)
+    rows: List[Dict[str, Any]] = []
+    for root in sorted(members):
+        group = sorted(members[root])
+        first = claims[group[0]]
+        rows.append({"id": len(rows) + 1, "title": first["title"],
+                     "raised_by": [claims[k]["peer"] for k in group], "reproduced_by": [],
+                     "severity": _guess(first["head"], SEVERITY_WORDS) or _guess(first["text"], SEVERITY_WORDS) or "minor",
+                     "category": _guess(first["text"], CATEGORY_WORDS) or "correctness",
+                     "verdict": None, "outcome": None, "note": "",
+                     "excerpts": {claims[k]["peer"]: claims[k]["text"][:400] for k in group}})
+    return rows
+
+
+def final_answers(bundle: Path, manifest: Dict[str, Any], only: Optional[Sequence[str]]) -> Dict[str, str]:
+    answers: Dict[str, str] = {}
+    for rec in manifest.get("reviews", []):
+        if only and not any(Path(rec.get("file", "")).name.startswith(o) for o in only):
+            continue
+        run_dir = rec.get("run_dir")
+        if not run_dir:
+            continue
+        for f in sorted((Path(run_dir) / "final").glob("*.txt")):
+            text = f.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                answers[f.stem] = (answers.get(f.stem, "") + "\n\n" + text).strip()
+    return answers
+
+
+def cmd_draft_findings(args: argparse.Namespace) -> int:
+    bundle = resolve_bundle(args.bundle)
+    manifest = load_manifest(bundle)
+    answers = final_answers(bundle, manifest, args.review)
+    if not answers:
+        raise HandoffError("no peer answers in this bundle's review runs (runs/*/final/*.txt); "
+                           "read reviews/*.md and list the findings by hand")
+    rows = draft_findings(answers)
+    out = {
+        "bundle": manifest["id"],
+        "how_to_use": ("A draft. Each row is one claim, merged across peers when they read alike; the merge "
+                       "is a guess, so split or join rows as needed and delete rows that are not findings. "
+                       "Check every claim in the code, then set severity, category, verdict and outcome, list "
+                       "in reproduced_by the peers that showed a reproduction, and write a note. Then run "
+                       "`handoff findings RECORD --from THIS_FILE`. `excerpts` is dropped on import."),
+        "allowed": {"severity": list(findings.SEVERITY_WEIGHT), "category": list(findings.CATEGORIES),
+                    "verdict": list(findings.VERDICT_FACTOR), "outcome": list(findings.OUTCOME_FACTOR)},
+        "peers": sorted(answers),
+        "findings": rows,
+    }
+    text = json.dumps(out, indent=2, ensure_ascii=False) + "\n"
+    if args.out:
+        write(Path(args.out).expanduser(), text)
+        print(f"{args.out}: {len(rows)} draft findings from {len(answers)} peers", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+# ---------------------------------------------------------------- preflight
+
+SECRET_PATTERNS = (
+    ("AWS access key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}")),
+    ("API secret key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("Slack token", re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("Linear API key", re.compile(r"lin_api_[A-Za-z0-9]{20,}")),
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+)
+
+
+def scan_bundle(bundle: Path, max_kb: int) -> tuple:
+    problems: List[str] = []
+    warnings: List[str] = []
+    for brief in sorted(bundle.glob("brief-*.md")):
+        kb = brief.stat().st_size / 1024
+        if kb > max_kb and brief.name != "brief-implement.md":
+            warnings.append(f"{brief.name} is {kb:.0f} KB: every peer re-reads it on each turn, which drives "
+                            "cost; link big files by path, and send screenshots plus a short data note "
+                            "instead of inline HTML or CSV")
+    for f in sorted(p for p in bundle.rglob("*") if p.is_file() and "worktrees" not in p.parts
+                    and "runs" not in p.parts and "reviews" not in p.parts):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for label, pattern in SECRET_PATTERNS:
+            if pattern.search(text):
+                problems.append(f"{f.relative_to(bundle)} contains what looks like a {label}; remove it "
+                                "before any peer sees the bundle")
+    return problems, warnings
+
+
+def ping_peer(porch: str, agent: str, timeout: int) -> tuple:
+    with tempfile.TemporaryDirectory(prefix="handoff-ping-") as tmp:
+        prompt = Path(tmp) / "ping.md"
+        prompt.write_text("Reply with the single word PONG. Do not read or run anything.\n", encoding="utf-8")
+        env = dict(os.environ, PORCH_RUN_DIR=str(Path(tmp) / "run"))
+        try:
+            proc = subprocess.run([porch, "review", "ask", "--progress", "none", "-a", agent,
+                                   "--prompt-file", str(prompt)], cwd=tmp, capture_output=True, text=True,
+                                  timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+        except subprocess.TimeoutExpired:
+            return agent, False, f"no answer within {timeout}s"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout).strip().splitlines()[-1:] or [""]
+        return agent, False, f"porch exit {proc.returncode}: {tail[0][:200]}"
+    return agent, True, "answered" + ("" if "PONG" in proc.stdout.upper() else " (not with PONG; check the output)")
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    import fnmatch
+    from concurrent.futures import ThreadPoolExecutor
+    problems: List[str] = []
+    warnings: List[str] = []
+    porch = porch_bin()
+    info = agent_info()
+    if not info:
+        raise HandoffError("`porch --list-agents` listed no agents; check porch and its config")
+    selected = parse_agents(args.agents) if args.agents else [a for a, v in info.items() if v["enabled"] == "true"]
+    if not selected:
+        problems.append("no peers selected: none is enabled in the porch config and -a was not given")
+    print("| Peer | Backend | Model | Enabled | CLI found |")
+    print("|---|---|---|---|---|")
+    for a in selected:
+        v = info.get(a)
+        if v is None:
+            print(f"| {a} | ? | ? | ? | ? |")
+            problems.append(f"{a}: unknown peer id (`porch --list-agents` shows the ids)")
+            continue
+        print(f"| {a} | {v['backend']} | `{v['model']}` | {v['enabled']} | {v['available']} |")
+        if v["available"] == "false":
+            problems.append(f"{a}: its CLI is not installed or not on PATH; without -a a review skips it silently")
+        if v["enabled"] != "true":
+            warnings.append(f"{a}: disabled in the config; it runs only because it was passed with -a")
+    for a in selected:
+        for pattern in args.refuse or []:
+            if fnmatch.fnmatch(a, pattern):
+                problems.append(f"{a}: refused by --refuse {pattern}")
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    if any(info.get(a, {}).get("available") == "false" for a in selected):
+        for d in ("/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local/bin")):
+            if Path(d).is_dir() and d not in path_dirs:
+                warnings.append(f"{d} exists but is not on PATH; agent CLIs installed there look missing")
+    if args.bundle:
+        p, w = scan_bundle(resolve_bundle(args.bundle), args.max_brief_kb)
+        problems += p
+        warnings += w
+    if args.ping and not problems:
+        ready = [a for a in selected if info.get(a, {}).get("available") != "false"]
+        with ThreadPoolExecutor(max_workers=max(len(ready), 1)) as pool:
+            for agent, ok, detail in pool.map(lambda a: ping_peer(porch, a, args.ping_timeout), ready):
+                print(f"ping {agent}: {detail}")
+                if not ok:
+                    problems.append(f"{agent}: ping failed ({detail})")
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    for p in problems:
+        print(f"problem: {p}", file=sys.stderr)
+    print(("preflight failed: " + str(len(problems)) + " problem(s)") if problems else
+          f"preflight ok: {len(selected)} peer(s)" + (f", {len(warnings)} warning(s)" if warnings else ""),
+          file=sys.stderr)
+    return 1 if problems else 0
 
 
 def cmd_scoreboard(args: argparse.Namespace) -> int:
@@ -1307,8 +1707,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slug", help="short name for the bundle id")
     p.add_argument("--include-uncommitted", action="store_true",
                    help="hand over the working tree as it is (base → working tree, untracked files included)")
+    p.add_argument("--previous", metavar="BUNDLE",
+                   help="follow-up round: base defaults to that bundle's head, its task is reused, "
+                        "and the brief says to review only what changed since")
+    p.add_argument("--open-findings", metavar="PATH",
+                   help="with --previous: findings of the earlier round the fixes address (Markdown or text)")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("preflight", help="check peers before a round: ids, CLIs, PATH, optional ping and bundle scan")
+    p.add_argument("-a", "--agents", help="comma-separated porch agent ids (default: porch enabled pool)")
+    p.add_argument("--refuse", action="append", metavar="GLOB",
+                   help="fail if a selected peer id matches this pattern (repeatable), e.g. a billing rule")
+    p.add_argument("--ping", action="store_true", help="send each peer a one-line question and require an answer")
+    p.add_argument("--ping-timeout", type=int, default=180, metavar="SEC", help="per-peer ping limit (default 180)")
+    p.add_argument("--bundle", help="also check this bundle: brief size and secret-looking strings")
+    p.add_argument("--max-brief-kb", type=int, default=60, help="warn above this brief size (default 60)")
+    p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("review", help="peer review of the handed-over work (read-only, porch review)")
     p.add_argument("bundle")
@@ -1321,6 +1736,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress", choices=["full", "compact", "none"], default="compact")
     p.add_argument("--allow-head-mismatch", action="store_true",
                    help="review the checkout as it is, even if it is not at the bundle's head commit")
+    p.add_argument("--peer-timeout", type=int, metavar="MIN",
+                   help="stop a peer still running after MIN minutes and report it failed (kinds ask and proposal)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_review)
 
@@ -1345,8 +1762,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how open the task is: 1 precise … 5 exploratory")
     p.set_defaults(func=cmd_report)
 
+    p = sub.add_parser("draft-findings", help="draft the findings list from the peers' reports, merged across peers")
+    p.add_argument("bundle")
+    p.add_argument("--review", action="append", metavar="STAMP",
+                   help="only reviews whose file name starts with STAMP (default: all in the bundle)")
+    p.add_argument("--out", help="write the draft JSON here (default: stdout)")
+    p.set_defaults(func=cmd_draft_findings)
+
     p = sub.add_parser("findings", help="check a round record's findings and write its per-peer score")
     p.add_argument("record", help="round record written by `report`, with `findings` filled in")
+    p.add_argument("--from", dest="source", metavar="JSON",
+                   help="take the findings list from this file (a `draft-findings` file after you set "
+                        "verdict and outcome) and write it into the record")
     p.set_defaults(func=cmd_findings)
 
     p = sub.add_parser("scoreboard", help="per-model value across round records: findings, cost, failures")
